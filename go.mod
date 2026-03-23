@@ -1,4 +1,4 @@
-module github.com/example/energy-balancer
+module github.com/umbralcalc/energy-balancer
 
 go 1.25.2
 
