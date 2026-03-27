@@ -1,0 +1,6 @@
+# Data files (large CSVs from API ingestion)
+dat/*.csv
+dat/*.log
+
+ingest
+!cmd/ingest/
