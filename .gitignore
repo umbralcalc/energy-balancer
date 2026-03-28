@@ -4,3 +4,6 @@ dat/*.log
 
 ingest
 !cmd/ingest/
+
+simulate
+!cmd/simulate/

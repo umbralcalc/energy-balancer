@@ -1,0 +1,16 @@
+iterations:
+- name: grid_data
+  params: {}
+  init_state_values: [21783.0, 2804.0, 0.0]
+  seed: 0
+  state_width: 3
+  state_history_depth: 2
+- name: residual_demand
+  params:
+    upstream_partition: [0]
+  init_state_values: [18979.0]
+  seed: 0
+  state_width: 1
+  state_history_depth: 2
+init_time_value: 0.0
+timesteps_history_depth: 2
