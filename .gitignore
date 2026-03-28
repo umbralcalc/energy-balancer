@@ -8,5 +8,8 @@ ingest
 simulate
 !cmd/simulate/
 
+evaluate
+!cmd/evaluate/
+
 infer
 !cmd/infer/

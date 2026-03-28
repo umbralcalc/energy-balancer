@@ -1,0 +1,78 @@
+iterations:
+- name: grid_data          # index 0
+  params: {}
+  init_state_values: [22000.0, 1500.0, 0.0]
+  seed: 0
+  state_width: 3
+  state_history_depth: 2
+- name: residual_demand    # index 1
+  params:
+    upstream_partition: [0]
+  init_state_values: [20500.0]
+  seed: 0
+  state_width: 1
+  state_history_depth: 2
+- name: price_noise        # index 2 — zero noise for predictable price
+  params:
+    thetas: [2.0]
+    mus: [0.0]
+    sigmas: [0.0]
+  init_state_values: [0.0]
+  seed: 42
+  state_width: 1
+  state_history_depth: 2
+- name: imbalance_price    # index 3 — constant 50 £/MWh (slope=0, intercept=50)
+  params:
+    demand_slope: [0.0]
+    demand_intercept: [50.0]
+    demand_partition: [1]
+    noise_partition: [2]
+  init_state_values: [50.0]
+  seed: 0
+  state_width: 1
+  state_history_depth: 2
+- name: carbon_data        # index 4 — init high so discharge test works
+  params: {}
+  init_state_values: [300.0, 290.0]
+  seed: 0
+  state_width: 2
+  state_history_depth: 2
+- name: battery            # index 5 — fixed dispatch 100 MW (discharge)
+  params:
+    dispatch_mw: [100.0]
+    energy_capacity_mwh: [200.0]
+    power_rating_mw: [100.0]
+    charge_efficiency: [0.92]
+    discharge_efficiency: [0.92]
+    min_soc_fraction: [0.1]
+    max_soc_fraction: [0.9]
+  init_state_values: [100.0, 0.0]
+  seed: 0
+  state_width: 2
+  state_history_depth: 2
+- name: degradation        # index 6
+  params:
+    battery_partition: [5]
+    energy_capacity_mwh: [200.0]
+  init_state_values: [0.0]
+  seed: 0
+  state_width: 1
+  state_history_depth: 2
+- name: revenue            # index 7
+  params:
+    battery_partition: [5]
+    price_partition: [3]
+  init_state_values: [0.0]
+  seed: 0
+  state_width: 1
+  state_history_depth: 2
+- name: carbon_savings     # index 8
+  params:
+    battery_partition: [5]
+    carbon_partition: [4]
+  init_state_values: [0.0]
+  seed: 0
+  state_width: 1
+  state_history_depth: 2
+init_time_value: 0.0
+timesteps_history_depth: 2

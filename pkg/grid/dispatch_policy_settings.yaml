@@ -1,0 +1,45 @@
+iterations:
+- name: grid_data          # index 0
+  params: {}
+  init_state_values: [22000.0, 1500.0, 0.0]
+  seed: 0
+  state_width: 3
+  state_history_depth: 2
+- name: residual_demand    # index 1
+  params:
+    upstream_partition: [0]
+  init_state_values: [20500.0]
+  seed: 0
+  state_width: 1
+  state_history_depth: 2
+- name: price_noise        # index 2 — OU noise (mu=0)
+  params:
+    thetas: [2.0]
+    mus: [0.0]
+    sigmas: [5.0]
+  init_state_values: [0.0]
+  seed: 42
+  state_width: 1
+  state_history_depth: 2
+- name: imbalance_price    # index 3; init set high to test discharge signal
+  params:
+    demand_slope: [0.002]
+    demand_intercept: [-10.0]
+    demand_partition: [1]
+    noise_partition: [2]
+  init_state_values: [50.0]
+  seed: 0
+  state_width: 1
+  state_history_depth: 2
+- name: dispatch_policy    # index 4
+  params:
+    price_partition: [3]
+    price_high: [45.0]
+    price_low: [25.0]
+    power_rating_mw: [100.0]
+  init_state_values: [0.0]
+  seed: 0
+  state_width: 1
+  state_history_depth: 2
+init_time_value: 0.0
+timesteps_history_depth: 2
