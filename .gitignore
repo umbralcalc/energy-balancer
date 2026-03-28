@@ -7,3 +7,6 @@ ingest
 
 simulate
 !cmd/simulate/
+
+infer
+!cmd/infer/
