@@ -1,4 +1,4 @@
-package custom
+package grid
 
 import (
 	"github.com/umbralcalc/stochadex/pkg/simulator"
