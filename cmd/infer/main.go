@@ -4,10 +4,11 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 
 	"github.com/umbralcalc/energy-balancer/pkg/grid"
 	"github.com/umbralcalc/stochadex/pkg/analysis"
-	"github.com/umbralcalc/stochadex/pkg/continuous"
+	"github.com/umbralcalc/stochadex/pkg/general"
 	"github.com/umbralcalc/stochadex/pkg/inference"
 	"github.com/umbralcalc/stochadex/pkg/kernels"
 	"github.com/umbralcalc/stochadex/pkg/simulator"
@@ -17,13 +18,14 @@ func main() {
 	dataPath := flag.String("data", "dat/demand.csv", "Path to NESO demand CSV")
 	steps := flag.Int("steps", 2016, "Number of steps to infer over (default: ~6 weeks)")
 	ouTheta := flag.Float64("theta", 0.5, "Initial OU theta guess (mean-reversion speed per half-hour)")
-	ouSigma := flag.Float64("sigma", 1000.0, "Initial OU sigma guess (MW per sqrt-half-hour)")
+	ouSigma := flag.Float64("sigma", 1000.0, "Initial OU sigma guess (MW per sqrt-half-hour); stored internally as log(sigma)")
 	windowDepth := flag.Int("window", 100, "Rolling window depth for mean/variance estimation")
 	pastDiscount := flag.Float64("discount", 1.0, "Past discounting factor for posterior (1.0 = full memory)")
 	flag.Parse()
 
 	// Step 1: Replay observed demand data to populate storage.
-	// Partitions: grid_data, residual_demand, conditional_mean.
+	// Also computes lagged_residual_demand = residual_demand[t-1], used in
+	// the OU transition likelihood as the previous state.
 	log.Println("Step 1: Replaying observed demand data...")
 	storage := analysis.NewStateTimeStorageFromPartitions(
 		[]*simulator.PartitionConfig{
@@ -39,13 +41,11 @@ func main() {
 				Name:      "residual_demand",
 				Iteration: &grid.ResidualDemandIteration{},
 				Params:    simulator.NewParams(make(map[string][]float64)),
-				// ParamsAsPartitions resolves "grid_data" to its integer index,
-				// which ResidualDemandIteration.Configure reads as upstream_partition.
 				ParamsAsPartitions: map[string][]string{
 					"upstream_partition": {"grid_data"},
 				},
 				InitStateValues:   []float64{20500},
-				StateHistoryDepth: *windowDepth,
+				StateHistoryDepth: 1,
 				Seed:              0,
 			},
 			{
@@ -53,7 +53,18 @@ func main() {
 				Iteration:         &grid.ConditionalMeanIteration{CsvPath: *dataPath},
 				Params:            simulator.NewParams(make(map[string][]float64)),
 				InitStateValues:   []float64{20500},
-				StateHistoryDepth: *windowDepth,
+				StateHistoryDepth: 1,
+				Seed:              0,
+			},
+			{
+				Name:      "lagged_residual_demand",
+				Iteration: &grid.LaggedValuesIteration{},
+				Params:    simulator.NewParams(make(map[string][]float64)),
+				ParamsAsPartitions: map[string][]string{
+					"source_partition": {"residual_demand"},
+				},
+				InitStateValues:   []float64{20500},
+				StateHistoryDepth: 1,
 				Seed:              0,
 			},
 		},
@@ -64,7 +75,6 @@ func main() {
 	log.Printf("  %d steps stored", len(storage.GetTimes()))
 
 	// Step 2: Compute rolling mean and variance of observed residual demand.
-	// These characterise the empirical distribution the OU model must match.
 	log.Println("Step 2: Computing rolling mean and variance of residual demand...")
 	meanPartition := analysis.NewVectorMeanPartition(
 		analysis.AppliedAggregation{
@@ -104,37 +114,40 @@ func main() {
 	)
 	log.Println("  Rolling statistics computed")
 
-	// Step 3: Infer OU parameters [theta, sigma] using posterior estimation.
+	// Step 3: Infer OU parameters [theta, sigma] using posterior estimation
+	// with the exact OU transition likelihood.
 	//
-	// Pattern follows simulation_inference_test.go in the stochadex test suite:
-	//   - ou_params_sampler  generates candidate [theta, sigma] from the current posterior
-	//   - comparison window  simulates OU(theta, sigma) with mus=conditional_mean
-	//   - loglikelihood      evaluates how well the synthetic OU output matches the
-	//                        empirical distribution of observed residual demand
-	//   - ou_posterior_mean  tracks the likelihood-weighted mean of [theta, sigma]
+	// At each outer step, the sampler draws candidate [theta, sigma] from the
+	// current posterior. Inside the comparison window, we evaluate the cumulative
+	// OU transition log-likelihood over windowDepth observed steps:
 	//
-	// The inferred parameters converge to the [theta, sigma] that make the OU
-	// simulation statistically consistent with the observed residual demand.
+	//   sum_n log P(X(t-n+1) | X(t-n), theta, sigma, mu(t-n+1))
+	//
+	// using the Euler-Maruyama density: X_next ~ N(X_prev + theta*(mu-X_prev)*dt, sigma^2*dt).
+	//
+	// This is numerically stable for all theta (no inner simulation to diverge),
+	// so the posterior correctly weights negative theta as near-zero probability.
 	log.Println("Step 3: Inferring OU parameters via posterior estimation...")
 
-	ouSyntheticConfig := &simulator.PartitionConfig{
-		Name: "ou_synthetic",
-		Iteration: &continuous.OrnsteinUhlenbeckIteration{},
-		Params: simulator.NewParams(map[string][]float64{
-			"thetas": {*ouTheta},
-			"sigmas": {*ouSigma},
-			"mus":    {20500},
-		}),
-		InitStateValues:   []float64{20500},
+	// Convert sigma to log scale: OUTransitionLikelihood interprets "sigmas" as log(sigma).
+	// Both theta and log(sigma) are ~O(1), preventing covariance corruption from scale mismatch.
+	logSigma := math.Log(*ouSigma)
+
+	// Passthrough partition: exposes the current sampler's [theta, log(sigma)] as
+	// inner-simulation state, so comparison.ParamsFromUpstream can wire them.
+	ouParamsPassthrough := &simulator.PartitionConfig{
+		Name:              "ou_params_passthrough",
+		Iteration:         &general.ParamValuesIteration{},
+		Params:            simulator.NewParams(map[string][]float64{"param_values": {*ouTheta, logSigma}}),
+		InitStateValues:   []float64{*ouTheta, logSigma},
 		StateHistoryDepth: 1,
-		Seed:              99,
+		Seed:              0,
 	}
 
-	// Prior covariance: diagonal [theta_var, sigma_var].
-	// Chosen to cover plausible OU parameter ranges:
-	//   theta ~ [0.01, 10] per half-hour → variance 4.0
-	//   sigma ~ [100, 5000] MW/sqrt(hh) → variance 2.5e6
-	priorCov := []float64{4.0, 0.0, 0.0, 2.5e6}
+	// Prior covariance: diagonal [theta_var, log_sigma_var].
+	//   theta    ~ N(0.5, 0.25)  → std 0.5
+	//   log(sigma) ~ N(log(1000), 1.0) → std 1.0 (covers ~e^-1 to e^1 multiplicative range)
+	priorCov := []float64{0.25, 0.0, 0.0, 1.0}
 
 	posteriorPartitions := analysis.NewPosteriorEstimationPartitions(
 		analysis.AppliedPosteriorEstimation{
@@ -144,7 +157,7 @@ func main() {
 			},
 			Mean: analysis.PosteriorMean{
 				Name:    "ou_posterior_mean",
-				Default: []float64{*ouTheta, *ouSigma},
+				Default: []float64{*ouTheta, logSigma},
 			},
 			Covariance: analysis.PosteriorCovariance{
 				Name:    "ou_posterior_cov",
@@ -152,12 +165,11 @@ func main() {
 			},
 			Sampler: analysis.PosteriorSampler{
 				Name:    "ou_params_sampler",
-				Default: []float64{*ouTheta, *ouSigma},
+				Default: []float64{*ouTheta, logSigma},
 				Distribution: analysis.ParameterisedModel{
 					Likelihood: &inference.NormalLikelihoodDistribution{},
 					Params: simulator.NewParams(map[string][]float64{
 						"default_covariance": priorCov,
-						"cov_burn_in_steps":  {float64(*windowDepth)},
 					}),
 					ParamsFromUpstream: map[string]simulator.NamedUpstreamConfig{
 						"mean":              {Upstream: "ou_posterior_mean"},
@@ -167,31 +179,32 @@ func main() {
 			},
 			Comparison: analysis.AppliedLikelihoodComparison{
 				Name: "ou_loglikelihood",
-				// Model evaluates how likely the OU synthetic output is given
-				// the empirical distribution of observed residual demand.
+				// Model evaluates the OU transition log-likelihood using the
+				// Euler-Maruyama density. Inside the window, residual_demand and
+				// lagged_residual_demand replay historical X(t) and X(t-1);
+				// conditional_mean replays historical mu(t). The sampler's
+				// [theta, sigma] are forwarded via ou_params_passthrough.
 				Model: analysis.ParameterisedModel{
-					Likelihood: &inference.NormalLikelihoodDistribution{},
+					Likelihood: &grid.OUTransitionLikelihood{},
 					Params:     simulator.NewParams(make(map[string][]float64)),
 					ParamsFromUpstream: map[string]simulator.NamedUpstreamConfig{
-						"mean":     {Upstream: "residual_demand_mean"},
-						"variance": {Upstream: "residual_demand_var"},
+						"previous_state": {Upstream: "lagged_residual_demand"},
+						"mus":            {Upstream: "conditional_mean"},
+						"thetas":         {Upstream: "ou_params_passthrough", Indices: []int{0}},
+						"sigmas":         {Upstream: "ou_params_passthrough", Indices: []int{1}},
 					},
 				},
-				// Compare synthetic OU output against the empirical distribution.
-				Data: analysis.DataRef{PartitionName: "ou_synthetic"},
+				Data: analysis.DataRef{PartitionName: "residual_demand"},
 				Window: analysis.WindowedPartitions{
 					Partitions: []analysis.WindowedPartition{{
-						Partition: ouSyntheticConfig,
-						// Wire theta and sigma from the sampler; mus from conditional_mean.
+						Partition: ouParamsPassthrough,
 						OutsideUpstreams: map[string]simulator.NamedUpstreamConfig{
-							"thetas": {Upstream: "ou_params_sampler", Indices: []int{0}},
-							"sigmas": {Upstream: "ou_params_sampler", Indices: []int{1}},
-							"mus":    {Upstream: "conditional_mean"},
+							"param_values": {Upstream: "ou_params_sampler"},
 						},
 					}},
 					Data: []analysis.DataRef{
-						{PartitionName: "residual_demand_mean"},
-						{PartitionName: "residual_demand_var"},
+						{PartitionName: "residual_demand"},
+						{PartitionName: "lagged_residual_demand"},
 						{PartitionName: "conditional_mean"},
 					},
 					Depth: *windowDepth,
@@ -208,24 +221,51 @@ func main() {
 		storage,
 		posteriorPartitions,
 		map[string]int{
-			"residual_demand":      *windowDepth,
-			"conditional_mean":     *windowDepth,
-			"residual_demand_mean": *windowDepth,
-			"residual_demand_var":  *windowDepth,
+			"residual_demand":        *windowDepth,
+			"lagged_residual_demand": *windowDepth,
+			"conditional_mean":       *windowDepth,
+			"residual_demand_mean":   *windowDepth,
+			"residual_demand_var":    *windowDepth,
 		},
 	)
 
-	// Extract inferred parameters from the final posterior mean.
 	posteriorMeanValues := storage.GetValues("ou_posterior_mean")
 	finalParams := posteriorMeanValues[len(posteriorMeanValues)-1]
+
+	// Debug: print a sample of posterior mean values over time.
+	loglikeValues := storage.GetValues("ou_loglikelihood")
+	samplerValues := storage.GetValues("ou_params_sampler")
+	logNormValues := storage.GetValues("ou_log_norm")
+	covValues := storage.GetValues("ou_posterior_cov")
+	fmt.Println()
+	fmt.Println("Step | theta_mean | logσ_mean | sampler_θ | sampler_σ | loglike_last |  cov00 |  cov01 |  cov11")
+	stride := len(posteriorMeanValues) / 30
+	if stride < 1 {
+		stride = 1
+	}
+	for i := 0; i < len(posteriorMeanValues); i += stride {
+		ll := loglikeValues[i][len(loglikeValues[i])-1]
+		_ = logNormValues
+		fmt.Printf("%4d | %10.4f | %9.4f | %9.4f | %9.4f | %12.2f | %6.3f | %6.3f | %6.3f\n",
+			i,
+			posteriorMeanValues[i][0],
+			posteriorMeanValues[i][1],
+			samplerValues[i][0],
+			samplerValues[i][1],
+			ll,
+			covValues[i][0],
+			covValues[i][1],
+			covValues[i][3],
+		)
+	}
 
 	fmt.Println()
 	fmt.Println("Inferred OU parameters for residual demand model:")
 	fmt.Printf("  theta (mean-reversion speed, per half-hour): %.4f\n", finalParams[0])
-	fmt.Printf("  sigma (volatility, MW/sqrt(half-hour)):      %.2f\n", finalParams[1])
+	fmt.Printf("  sigma (volatility, MW/sqrt(half-hour)):      %.2f\n", math.Exp(finalParams[1]))
 	fmt.Println()
 	fmt.Printf("Update cmd/simulate price_noise with these values:\n")
-	fmt.Printf("  thetas: [%.4f]  sigmas: [%.2f]\n", finalParams[0], finalParams[1])
+	fmt.Printf("  thetas: [%.4f]  sigmas: [%.2f]\n", finalParams[0], math.Exp(finalParams[1]))
 
 	log.Println("Done.")
 }
