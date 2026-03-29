@@ -9,7 +9,6 @@ import (
 	"github.com/umbralcalc/energy-balancer/pkg/grid"
 	"github.com/umbralcalc/stochadex/pkg/analysis"
 	"github.com/umbralcalc/stochadex/pkg/general"
-	"github.com/umbralcalc/stochadex/pkg/inference"
 	"github.com/umbralcalc/stochadex/pkg/kernels"
 	"github.com/umbralcalc/stochadex/pkg/simulator"
 )
@@ -17,10 +16,12 @@ import (
 func main() {
 	dataPath := flag.String("data", "dat/demand.csv", "Path to NESO demand CSV")
 	steps := flag.Int("steps", 2016, "Number of steps to infer over (default: ~6 weeks)")
-	ouTheta := flag.Float64("theta", 0.5, "Initial OU theta guess (mean-reversion speed per half-hour)")
-	ouSigma := flag.Float64("sigma", 1000.0, "Initial OU sigma guess (MW per sqrt-half-hour); stored internally as log(sigma)")
+	ouTheta := flag.Float64("theta", 0.2, "Initial OU theta guess (per half-hour); near OLS ~0.17 on typical demand")
+	ouSigma := flag.Float64("sigma", 1500.0, "Initial OU sigma guess (MW per sqrt-half-hour)")
 	windowDepth := flag.Int("window", 100, "Rolling window depth for mean/variance estimation")
 	pastDiscount := flag.Float64("discount", 1.0, "Past discounting factor for posterior (1.0 = full memory)")
+	runSBI := flag.Bool("sbi", false, "Run stochadex analysis posterior + rolling stats (slow); default is OLS/MLE only")
+	showAnalysisPosterior := flag.Bool("show-analysis-posterior", false, "With -sbi, print online posterior mean (often unstable; OLS is recommended)")
 	flag.Parse()
 
 	// Step 1: Replay observed demand data to populate storage.
@@ -74,6 +75,34 @@ func main() {
 	)
 	log.Printf("  %d steps stored", len(storage.GetTimes()))
 
+	demandStorage := storage
+	dt := 0.5
+	olsTheta, olsSigma := grid.ODEMLEFromStateTimeStorage(
+		demandStorage,
+		"residual_demand",
+		"lagged_residual_demand",
+		"conditional_mean",
+		dt,
+	)
+
+	if !*runSBI {
+		fmt.Println()
+		if math.IsNaN(olsTheta) || math.IsNaN(olsSigma) {
+			log.Println("Warning: OLS/MLE fit failed (insufficient or invalid data).")
+		} else {
+			fmt.Println("MLE/OLS on observed demand (recommended for cmd/simulate):")
+			fmt.Printf("  theta (mean-reversion speed, per half-hour): %.4f\n", olsTheta)
+			fmt.Printf("  sigma (volatility, MW/sqrt(half-hour)):      %.2f\n", olsSigma)
+		}
+		fmt.Println()
+		if !math.IsNaN(olsTheta) && !math.IsNaN(olsSigma) {
+			fmt.Println("Update cmd/simulate price_noise with:")
+			fmt.Printf("  thetas: [%.4f]  sigmas: [%.2f]\n", olsTheta, olsSigma)
+		}
+		log.Println("Done. (Pass -sbi to run analysis-package posterior estimation.)")
+		return
+	}
+
 	// Step 2: Compute rolling mean and variance of observed residual demand.
 	log.Println("Step 2: Computing rolling mean and variance of residual demand...")
 	meanPartition := analysis.NewVectorMeanPartition(
@@ -114,39 +143,32 @@ func main() {
 	)
 	log.Println("  Rolling statistics computed")
 
-	// Step 3: Infer OU parameters [theta, sigma] using posterior estimation
-	// with the exact OU transition likelihood.
-	//
-	// At each outer step, the sampler draws candidate [theta, sigma] from the
-	// current posterior. Inside the comparison window, we evaluate the cumulative
-	// OU transition log-likelihood over windowDepth observed steps:
-	//
-	//   sum_n log P(X(t-n+1) | X(t-n), theta, sigma, mu(t-n+1))
-	//
-	// using the Euler-Maruyama density: X_next ~ N(X_prev + theta*(mu-X_prev)*dt, sigma^2*dt).
-	//
-	// This is numerically stable for all theta (no inner simulation to diverge),
-	// so the posterior correctly weights negative theta as near-zero probability.
+	// analysis.NewPosteriorEstimationPartitions appends: ou_log_norm, ou_posterior_mean,
+	// ou_posterior_cov, ou_params_sampler, ou_loglikelihood — so posterior mean is at
+	// len(storage.GetNames())+1 regardless of map iteration order in GetNames().
+	posteriorMeanPartitionIdx := float64(len(storage.GetNames()) + 1)
+
+	// Step 3: Posterior estimation (analysis.NewPosteriorEstimationPartitions).
+	// Latent state is [log(theta), log(sigma)]; OUTransitionLikelihood exp()s them.
+	// The sampler uses grid.OUParamsProposal (two independent normals), not
+	// inference.NormalLikelihoodDistribution: the latter produced perfectly
+	// correlated draws once the embedded window ran past burn-in.
 	log.Println("Step 3: Inferring OU parameters via posterior estimation...")
 
-	// Convert sigma to log scale: OUTransitionLikelihood interprets "sigmas" as log(sigma).
-	// Both theta and log(sigma) are ~O(1), preventing covariance corruption from scale mismatch.
+	logTheta := math.Log(*ouTheta)
 	logSigma := math.Log(*ouSigma)
 
-	// Passthrough partition: exposes the current sampler's [theta, log(sigma)] as
-	// inner-simulation state, so comparison.ParamsFromUpstream can wire them.
+	// Passthrough: inner window reads [log(theta), log(sigma)] from the sampler.
 	ouParamsPassthrough := &simulator.PartitionConfig{
 		Name:              "ou_params_passthrough",
 		Iteration:         &general.ParamValuesIteration{},
-		Params:            simulator.NewParams(map[string][]float64{"param_values": {*ouTheta, logSigma}}),
-		InitStateValues:   []float64{*ouTheta, logSigma},
+		Params:            simulator.NewParams(map[string][]float64{"param_values": {logTheta, logSigma}}),
+		InitStateValues:   []float64{logTheta, logSigma},
 		StateHistoryDepth: 1,
 		Seed:              0,
 	}
 
-	// Prior covariance: diagonal [theta_var, log_sigma_var].
-	//   theta    ~ N(0.5, 0.25)  → std 0.5
-	//   log(sigma) ~ N(log(1000), 1.0) → std 1.0 (covers ~e^-1 to e^1 multiplicative range)
+	// Prior / initial covariance for ou_posterior_cov (online estimate; not used by sampler).
 	priorCov := []float64{0.25, 0.0, 0.0, 1.0}
 
 	posteriorPartitions := analysis.NewPosteriorEstimationPartitions(
@@ -157,7 +179,7 @@ func main() {
 			},
 			Mean: analysis.PosteriorMean{
 				Name:    "ou_posterior_mean",
-				Default: []float64{*ouTheta, logSigma},
+				Default: []float64{logTheta, logSigma},
 			},
 			Covariance: analysis.PosteriorCovariance{
 				Name:    "ou_posterior_cov",
@@ -165,22 +187,22 @@ func main() {
 			},
 			Sampler: analysis.PosteriorSampler{
 				Name:    "ou_params_sampler",
-				Default: []float64{*ouTheta, logSigma},
+				Default: []float64{logTheta, logSigma},
 				Distribution: analysis.ParameterisedModel{
-					Likelihood: &inference.NormalLikelihoodDistribution{},
+					// Independent log-normal random walk proposals (not distmv.Normal):
+					// the stock NormalLikelihood path produced perfectly correlated
+					// samples once the embedded likelihood ran past burn-in.
+					Likelihood: &grid.OUParamsProposal{},
 					Params: simulator.NewParams(map[string][]float64{
-						"default_covariance": priorCov,
+						"proposal_std_log_theta":         {0.5},
+						"proposal_std_log_sigma":         {1.0},
+						"posterior_mean_partition_index": {posteriorMeanPartitionIdx},
 					}),
-					ParamsFromUpstream: map[string]simulator.NamedUpstreamConfig{
-						"mean":              {Upstream: "ou_posterior_mean"},
-						"covariance_matrix": {Upstream: "ou_posterior_cov"},
-					},
 				},
 			},
 			Comparison: analysis.AppliedLikelihoodComparison{
 				Name: "ou_loglikelihood",
-				// Model evaluates the OU transition log-likelihood using the
-				// Euler-Maruyama density. Inside the window, residual_demand and
+				// Exact OU transition density. Inside the window, residual_demand and
 				// lagged_residual_demand replay historical X(t) and X(t-1);
 				// conditional_mean replays historical mu(t). The sampler's
 				// [theta, sigma] are forwarded via ou_params_passthrough.
@@ -190,8 +212,8 @@ func main() {
 					ParamsFromUpstream: map[string]simulator.NamedUpstreamConfig{
 						"previous_state": {Upstream: "lagged_residual_demand"},
 						"mus":            {Upstream: "conditional_mean"},
-						"thetas":         {Upstream: "ou_params_passthrough", Indices: []int{0}},
-						"sigmas":         {Upstream: "ou_params_passthrough", Indices: []int{1}},
+						"thetas":         {Upstream: "ou_params_passthrough", Indices: []int{0}}, // log(theta)
+						"sigmas":         {Upstream: "ou_params_passthrough", Indices: []int{1}}, // log(sigma)
 					},
 				},
 				Data: analysis.DataRef{PartitionName: "residual_demand"},
@@ -231,41 +253,31 @@ func main() {
 
 	posteriorMeanValues := storage.GetValues("ou_posterior_mean")
 	finalParams := posteriorMeanValues[len(posteriorMeanValues)-1]
-
-	// Debug: print a sample of posterior mean values over time.
-	loglikeValues := storage.GetValues("ou_loglikelihood")
-	samplerValues := storage.GetValues("ou_params_sampler")
-	logNormValues := storage.GetValues("ou_log_norm")
-	covValues := storage.GetValues("ou_posterior_cov")
-	fmt.Println()
-	fmt.Println("Step | theta_mean | logσ_mean | sampler_θ | sampler_σ | loglike_last |  cov00 |  cov01 |  cov11")
-	stride := len(posteriorMeanValues) / 30
-	if stride < 1 {
-		stride = 1
-	}
-	for i := 0; i < len(posteriorMeanValues); i += stride {
-		ll := loglikeValues[i][len(loglikeValues[i])-1]
-		_ = logNormValues
-		fmt.Printf("%4d | %10.4f | %9.4f | %9.4f | %9.4f | %12.2f | %6.3f | %6.3f | %6.3f\n",
-			i,
-			posteriorMeanValues[i][0],
-			posteriorMeanValues[i][1],
-			samplerValues[i][0],
-			samplerValues[i][1],
-			ll,
-			covValues[i][0],
-			covValues[i][1],
-			covValues[i][3],
-		)
-	}
+	thetaHat := math.Exp(finalParams[0])
+	sigmaHat := math.Exp(finalParams[1])
 
 	fmt.Println()
-	fmt.Println("Inferred OU parameters for residual demand model:")
-	fmt.Printf("  theta (mean-reversion speed, per half-hour): %.4f\n", finalParams[0])
-	fmt.Printf("  sigma (volatility, MW/sqrt(half-hour)):      %.2f\n", math.Exp(finalParams[1]))
+	if math.IsNaN(olsTheta) || math.IsNaN(olsSigma) {
+		log.Println("Warning: OLS/MLE fit failed (insufficient or invalid data).")
+	} else {
+		fmt.Println("MLE/OLS on observed demand (recommended for cmd/simulate):")
+		fmt.Printf("  theta (mean-reversion speed, per half-hour): %.4f\n", olsTheta)
+		fmt.Printf("  sigma (volatility, MW/sqrt(half-hour)):      %.2f\n", olsSigma)
+	}
 	fmt.Println()
-	fmt.Printf("Update cmd/simulate price_noise with these values:\n")
-	fmt.Printf("  thetas: [%.4f]  sigmas: [%.2f]\n", finalParams[0], math.Exp(finalParams[1]))
+	if *showAnalysisPosterior {
+		fmt.Println("Online posterior mean (stochadex analysis — diagnostic only):")
+		fmt.Printf("  theta: %.4f\n", thetaHat)
+		fmt.Printf("  sigma: %.2f\n", sigmaHat)
+		fmt.Println()
+	}
+	if !math.IsNaN(olsTheta) && !math.IsNaN(olsSigma) {
+		fmt.Println("Update cmd/simulate price_noise with the MLE/OLS row:")
+		fmt.Printf("  thetas: [%.4f]  sigmas: [%.2f]\n", olsTheta, olsSigma)
+	} else {
+		fmt.Println("Update cmd/simulate using the diagnostic row if OLS failed.")
+		fmt.Printf("  thetas: [%.4f]  sigmas: [%.2f]\n", thetaHat, sigmaHat)
+	}
 
 	log.Println("Done.")
 }

@@ -10,19 +10,18 @@ import (
 // OUTransitionLikelihood evaluates the exact Ornstein-Uhlenbeck
 // transition log-likelihood: log P(X_next | X_prev, theta, sigma, mu).
 //
-// Uses the exact OU transition density (not Euler-Maruyama):
+// Uses the exact OU transition density:
 //
 //	mean = mu + (X_prev - mu) * exp(-theta * dt)
 //	var  = sigma^2 / (2*theta) * (1 - exp(-2*theta*dt))
 //
-// This is numerically stable for any theta > 0, including large values where
-// the EM approximation (which requires theta*dt << 1) breaks down catastrophically.
-// For theta <= 0 (explosive/non-mean-reverting) returns -Inf.
+// Params "thetas" and "sigmas" are log(theta) and log(sigma) so theta, sigma > 0
+// always (no -Inf from theta <= 0). For non-finite exp inputs, returns -Inf.
 //
 // Required params (set via ParamsFromUpstream):
 //
-//	"thetas"         - OU mean-reversion speed (scalar, must be > 0)
-//	"sigmas"         - log(sigma), OU volatility in log scale
+//	"thetas"         - log(theta), mean-reversion speed (scalar)
+//	"sigmas"         - log(sigma), diffusion scale (scalar)
 //	"mus"            - OU long-run mean (scalar)
 //	"previous_state" - X at the previous timestep (scalar)
 type OUTransitionLikelihood struct {
@@ -38,16 +37,20 @@ func (o *OUTransitionLikelihood) SetParams(
 	_ []*simulator.StateHistory,
 	timestepsHistory *simulator.CumulativeTimestepsHistory,
 ) {
-	theta := params.GetIndex("thetas", 0)
-	// "sigmas" param is log(sigma) — keeps sigma > 0 and puts it on a
-	// similar scale to theta, preventing covariance corruption.
-	sigma := math.Exp(params.GetIndex("sigmas", 0))
+	logTheta := params.GetIndex("thetas", 0)
+	logSigma := params.GetIndex("sigmas", 0)
+	if math.IsNaN(logTheta) || math.IsNaN(logSigma) ||
+		math.IsInf(logTheta, 0) || math.IsInf(logSigma, 0) {
+		o.std = -1
+		return
+	}
+	theta := math.Exp(logTheta)
+	sigma := math.Exp(logSigma)
 	mu := params.GetIndex("mus", 0)
 	xPrev := params.GetIndex("previous_state", 0)
 	dt := timestepsHistory.NextIncrement
 
 	if theta <= 0 {
-		// Non-mean-reverting: mark as invalid so EvaluateLogLike returns -Inf.
 		o.std = -1
 		return
 	}
