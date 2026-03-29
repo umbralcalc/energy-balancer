@@ -9,6 +9,7 @@ import (
 	"github.com/umbralcalc/energy-balancer/pkg/grid"
 	"github.com/umbralcalc/stochadex/pkg/analysis"
 	"github.com/umbralcalc/stochadex/pkg/general"
+	"github.com/umbralcalc/stochadex/pkg/inference"
 	"github.com/umbralcalc/stochadex/pkg/kernels"
 	"github.com/umbralcalc/stochadex/pkg/simulator"
 )
@@ -143,16 +144,12 @@ func main() {
 	)
 	log.Println("  Rolling statistics computed")
 
-	// analysis.NewPosteriorEstimationPartitions appends: ou_log_norm, ou_posterior_mean,
-	// ou_posterior_cov, ou_params_sampler, ou_loglikelihood — so posterior mean is at
-	// len(storage.GetNames())+1 regardless of map iteration order in GetNames().
-	posteriorMeanPartitionIdx := float64(len(storage.GetNames()) + 1)
-
 	// Step 3: Posterior estimation (analysis.NewPosteriorEstimationPartitions).
 	// Latent state is [log(theta), log(sigma)]; OUTransitionLikelihood exp()s them.
-	// The sampler uses grid.OUParamsProposal (two independent normals), not
-	// inference.NormalLikelihoodDistribution: the latter produced perfectly
-	// correlated draws once the embedded window ran past burn-in.
+	// The sampler uses inference.NormalLikelihoodDistribution with fixed diagonal
+	// variance (independent marginals). Mean comes from ou_posterior_mean; we do
+	// not wire covariance_matrix from ou_posterior_cov (dense MVN + streamed matrix
+	// previously produced perfectly correlated proposals mid-run).
 	log.Println("Step 3: Inferring OU parameters via posterior estimation...")
 
 	logTheta := math.Log(*ouTheta)
@@ -189,15 +186,14 @@ func main() {
 				Name:    "ou_params_sampler",
 				Default: []float64{logTheta, logSigma},
 				Distribution: analysis.ParameterisedModel{
-					// Independent log-normal random walk proposals (not distmv.Normal):
-					// the stock NormalLikelihood path produced perfectly correlated
-					// samples once the embedded likelihood ran past burn-in.
-					Likelihood: &grid.OUParamsProposal{},
+					Likelihood: &inference.NormalLikelihoodDistribution{},
 					Params: simulator.NewParams(map[string][]float64{
-						"proposal_std_log_theta":         {0.5},
-						"proposal_std_log_sigma":         {1.0},
-						"posterior_mean_partition_index": {posteriorMeanPartitionIdx},
+						// Diagonal proposal: match former OUParamsProposal stds 0.5, 1.0.
+						"variance": {0.25, 1.0},
 					}),
+					ParamsFromUpstream: map[string]simulator.NamedUpstreamConfig{
+						"mean": {Upstream: "ou_posterior_mean"},
+					},
 				},
 			},
 			Comparison: analysis.AppliedLikelihoodComparison{
