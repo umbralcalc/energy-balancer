@@ -1,363 +1,396 @@
-# UK Energy Grid Balancing Simulation: Project Plan
+# UK Energy Grid Balancing Simulation
 
-## Applying the Stochadex to Storage Dispatch and Demand Response Optimisation
-
----
-
-## Overview
-
-Build a stochastic simulation of the GB electricity system's supply-demand balance under increasing renewable penetration, learned from freely available generation, demand, and pricing data, with a decision science layer to evaluate and optimise battery storage dispatch and demand-side response strategies.
-
-The core question: **given the current grid state and stochastic forecasts for wind, solar and demand, what storage dispatch and demand response schedule minimises expected balancing cost and carbon intensity over the next 24–48 hours?**
+A stochastic simulation of the GB electricity system's supply-demand balance, built with the [stochadex](https://github.com/umbralcalc/stochadex) SDK. The project learns the joint dynamics of demand and renewable generation from NESO open data, then evaluates battery storage dispatch strategies under both current and projected 2030 grid conditions.
 
 ---
 
-## Why This Problem
+## The Problem
 
-- The UK has committed to a net-zero electricity system, with renewables expected to supply around 80% of total electricity by 2030, dominated by wind (~70% of renewables).
-- Wind and solar output are inherently stochastic — generation can swing by gigawatts within hours depending on weather. This intermittency creates balancing challenges that grow non-linearly with renewable penetration.
-- Grid-scale battery energy storage (BESS) capacity is growing rapidly in GB, with projects ranging from 98MW/196MWh (Yorkshire, linked to Dogger Bank offshore wind) to numerous smaller installations. BESS provides fast-response flexibility, but optimal dispatch under uncertainty is an unsolved operational problem.
-- The National Energy System Operator (NESO) spends billions annually on balancing services. Better dispatch strategies could reduce costs, cut carbon emissions from gas peaking plants, and reduce renewable curtailment.
-- Existing dispatch optimisation tools are predominantly deterministic (linear/mixed-integer programming) or use simplified stochastic models. They typically don't learn the joint stochastic dynamics of wind, solar, demand, and price from historical data — they assume them.
+The UK has committed to an ~80% renewable electricity system by 2030, dominated by wind. Wind and solar are inherently intermittent — national output can swing by several gigawatts within a few hours. This creates a balancing challenge that grows non-linearly with renewable penetration.
 
----
+Grid-scale battery energy storage (BESS) is a key flexibility tool, but optimal dispatch under uncertainty is unsolved. Existing approaches are either deterministic (LP/MILP) — which miss forecast uncertainty — or train on stylised environments that don't reflect real joint dynamics.
 
-## The Gap This Fills
-
-| Approach | Examples | Limitation |
-|----------|----------|------------|
-| Deterministic dispatch (LP/MILP) | PyPSA, standard unit commitment models | Don't propagate forecast uncertainty; can overestimate battery value by ~15% with relaxed formulations |
-| Stochastic programming | Two-stage scenario-based models (SDED-S) | Generate scenarios synthetically rather than learning joint dynamics from data; often computationally expensive |
-| RL-based dispatch | Various DQN/PPO battery controllers | Train on simplified environments, struggle with non-stationarity and multi-service stacking |
-| Market price forecasting | ARIMA, LSTM price predictors | Predict prices but don't simulate the physical system that generates them; can't evaluate policy counterfactuals |
-
-**The stochadex differentiator:** a generalised stochastic simulation that learns the joint dynamics of wind generation, solar generation, demand, and imbalance prices from years of half-hourly NESO/Elexon data, then uses the decision science layer to evaluate storage dispatch policies under realistic forecast uncertainty. Same proven pattern as AMR, flood risk, rugby, fishing — ingest freely available data, build a simulation that learns from it, optimise actions.
+This project takes a different approach: learn the stochastic residual demand process directly from half-hourly NESO data, then evaluate dispatch policies by simulating ensembles of trajectories drawn from the fitted model.
 
 ---
 
-## Phase 1: Data Ingestion
+## How It Works
 
-### 1.1 Generation mix and carbon intensity
-
-**Source: NESO Data Portal (formerly National Grid ESO)**
-
-- Historic generation mix and carbon intensity at half-hourly resolution
-- Generation by fuel type: gas, coal, nuclear, wind (national + embedded), solar, hydro, biomass, interconnectors, other (including BESS)
-- Day-ahead wind and solar forecasts at half-hourly resolution (within-day to 14 days ahead)
-- Weekly wind generator availability at MW level
-- Balancing costs and system prices
-
-**Portal:** `data.nationalgrideso.com`
-
-**Source: Carbon Intensity API (NESO + University of Oxford)**
-
-- National and regional carbon intensity (gCO₂/kWh) at half-hourly resolution
-- Generation mix percentages by fuel type per region and nationally
-- Forecast carbon intensity 96+ hours ahead
-- Free API, no registration required
-
-**API base:** `api.carbonintensity.org.uk`
+The pipeline has five stages, each a separate command:
 
 ```
-# National intensity for a date range
-GET /intensity/{from}/{to}
-
-# Regional generation mix for current half hour
-GET /regional
-
-# Intensity by postcode
-GET /regional/postcode/{postcode}
+cmd/ingest  →  cmd/infer  →  cmd/simulate  →  cmd/evaluate  →  cmd/plot
+(fetch data)   (fit model)   (run sim)         (compare policies)  (visualise)
 ```
 
-### 1.2 Solar PV generation
+### Stage 1 — Data Ingestion (`cmd/ingest`)
 
-**Source: Sheffield Solar PV_Live**
+Downloads half-hourly open data from four sources into `dat/`:
 
-- Half-hourly PV generation estimates for the entire GB network (embedded, non-BM solar)
-- National and regional (by Grid Supply Point or DNO area) breakdowns
-- Historical data from January 2013 onwards
-- Licensed under CC BY 4.0
-- Python API library available (`pvlive-api` on PyPI)
+| File | Source | Content |
+|---|---|---|
+| `demand.csv` | NESO Data Portal (CKAN API) | National demand, embedded wind and solar generation, 2020–2025 |
+| `carbon_intensity.csv` | Carbon Intensity API (Oxford/NESO) | Actual and forecast carbon intensity (gCO₂/kWh) |
+| `generation_mix.csv` | Carbon Intensity API | Generation mix percentages by fuel type |
+| `solar_pv.csv` | Sheffield Solar PV_Live | National solar PV generation estimates (MW) |
 
-**API:** `api0.solar.sheffield.ac.uk/pvlive/`
+The NESO demand CSV is the primary data source for model fitting. Its key columns are:
 
-### 1.3 Demand data
+- `ND` — national demand (MW), with embedded wind and solar already subtracted by NESO
+- `EMBEDDED_WIND_GENERATION` — behind-the-meter wind (MW)
+- `EMBEDDED_SOLAR_GENERATION` — behind-the-meter solar (MW)
 
-**Source: NESO Data Portal — Historic Demand Data**
-
-- Half-hourly national demand outturn and forecasts
-- Demand profiles and profile dates for forecast construction
-- Note: NESO "demand" = true demand minus embedded wind and solar (an important subtlety for modelling)
-
-### 1.4 Wholesale market and balancing data
-
-**Source: Elexon BMRS (Balancing Mechanism Reporting Service)**
-
-- System imbalance prices (reports B1770) and volumes (B1780) at half-hourly resolution
-- Generation by fuel type (actual)
-- Balancing Mechanism actions (bids, offers, acceptances) at BMU level
-- Final Physical Notifications (FPN), Maximum Export/Import Limits
-- Free API access with registration (scripting key)
-
-**API:** `bmrs.elexon.co.uk/api-documentation`
-
-Also available via the Elexon Insights Solution and IRIS near-real-time push service.
-
-### 1.5 Weather data
-
-**Source: Met Office DataPoint API**
-
-- Site-specific and gridded weather forecasts and observations
-- Wind speed, solar radiation, temperature — the physical drivers of generation and demand
-- Free API tier available (registration required)
-
-### 1.6 Initial data scope
-
-- **Time window:** 3–5 years of half-hourly data (2020–2025) for model fitting, covering the period of rapid renewable growth
-- **Resolution:** Half-hourly (matching the settlement period of the GB electricity market)
-- **Variables:** Wind generation (national + embedded), solar PV (from PV_Live), total demand, gas generation, interconnector flows, system imbalance price, carbon intensity
-
----
-
-## Phase 2: Model Structure
-
-### 2.1 State variables
-
-The stochadex simulation tracks the grid as a coupled stochastic system:
-
-1. **Wind generation process** — stochastic, driven by weather with strong diurnal and seasonal patterns, significant forecast error that grows with lead time
-2. **Solar PV generation process** — stochastic, driven by irradiance with deterministic seasonal envelope and stochastic cloud cover perturbation
-3. **Demand process** — stochastic with strong daily/weekly/seasonal structure, temperature dependence, and trend components (EV uptake, heat pump adoption)
-4. **Residual demand** — true demand minus wind minus solar. This is what dispatchable generation and storage must meet. Its stochastic behaviour is the core modelling challenge.
-5. **Battery state of charge (SoC)** — deterministic given dispatch decisions, but the optimal dispatch is a function of the stochastic forecasts above
-6. **System imbalance price** — stochastic, strongly correlated with residual demand and wind forecast error. The economic signal that storage dispatch responds to.
-
-### 2.2 Simulation diagram
+Residual demand — the net load that dispatchable plant and storage must meet — is:
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                  WEATHER STATE                           │
-│  Wind speed, irradiance, temperature (stochastic)        │
-│  Learned from Met Office + NESO forecast error analysis  │
-└────┬──────────────┬──────────────┬──────────────────────┘
-     │              │              │
-     ▼              ▼              ▼
-┌──────────┐ ┌──────────┐ ┌────────────────────────────┐
-│   WIND   │ │  SOLAR   │ │        DEMAND               │
-│   GEN    │ │  PV GEN  │ │  (temp-dependent +           │
-│ (MW, HH) │ │ (MW, HH) │ │   stochastic residual)      │
-└────┬─────┘ └────┬─────┘ └────────────┬───────────────┘
-     │            │                     │
-     └────────────┼─────────────────────┘
-                  ▼
-┌─────────────────────────────────────────────────────────┐
-│              RESIDUAL DEMAND                              │
-│  = Demand − Wind − Solar                                 │
-│  This is what dispatchable plant + storage must meet     │
-│  Its distribution is the core stochastic object          │
-└──────────┬──────────────────────────────────────────────┘
-           │
-           ▼
-┌─────────────────────────────────────────────────────────┐
-│            DISPATCHABLE RESPONSE                          │
-│  Gas CCGT/OCGT (merit order), interconnectors, hydro     │
-│  Modelled as price-responsive capacity with ramp limits  │
-└──────────┬──────────────────────────────────────────────┘
-           │
-           ▼
-┌─────────────────────────────────────────────────────────┐
-│         BATTERY STORAGE (POLICY LEVER)                    │
-│  Charge when: residual demand low / price low / RE high  │
-│  Discharge when: residual demand high / price high       │
-│  State: SoC, degradation, cycle count                    │
-│  Constraints: power rating, energy capacity, ramp rate   │
-└──────────┬──────────────────────────────────────────────┘
-           │
-           ▼
-┌─────────────────────────────────────────────────────────┐
-│         DEMAND RESPONSE (POLICY LEVER)                    │
-│  Shift flexible load (EV charging, heat pumps, industrial)│
-│  DFS-style incentive events during peak/tight periods    │
-│  Constraints: comfort, process requirements, rebound     │
-└──────────┬──────────────────────────────────────────────┘
-           │
-           ▼
-┌─────────────────────────────────────────────────────────┐
-│         OUTCOMES                                          │
-│  System balance (MW surplus/deficit per HH)              │
-│  Imbalance price (£/MWh)                                │
-│  Carbon intensity (gCO₂/kWh)                            │
-│  Balancing cost (£)                                     │
-│  Renewable curtailment (MWh)                            │
-└─────────────────────────────────────────────────────────┘
+residual_demand = ND - embedded_wind - embedded_solar
 ```
 
-### 2.3 Key modelling choices
+### Stage 2 — Parameter Inference (`cmd/infer`)
 
-- **National-level aggregation** initially: model the GB system as a single node. This is appropriate for storage dispatch and demand response decisions that respond to national price signals. Regional disaggregation (by DNO area) is an extension.
-- **Half-hourly time step** matching the settlement period — the natural cadence of the market and all data sources.
-- **Stochastic generation model** learned from observed joint distributions of wind, solar, and demand (not from weather models directly). The key is capturing the correlation structure — e.g., low wind often coincides with high pressure (cold, clear), meaning high demand and high solar in summer but high demand and low solar in winter.
-- **Battery degradation** modelled as a simple cycle-counting function with depth-of-discharge weighting, sufficient for policy comparison without needing electrochemical detail.
-- **Ensemble approach:** run hundreds of stochastic trajectories per policy to build distributions of cost, carbon, and curtailment outcomes.
+Fits an Ornstein-Uhlenbeck (OU) model to the observed residual demand series. The OU process is a natural choice: residual demand mean-reverts toward a time-varying conditional mean (the historical half-hourly average by settlement period index) with Gaussian noise.
 
----
+The discrete-time transition is:
 
-## Phase 3: Learning from Data
-
-### 3.1 Simulation-based inference
-
-The stochadex's established pattern:
-
-1. **Smooth and aggregate** the NESO/Elexon half-hourly data to characterise the joint stochastic behaviour of wind, solar, demand, and price — conditional on time of day, day of week, season, and weather regime.
-2. **Fit deviation coefficients** using SBI, matching simulated residual demand and price trajectories to observed historical data.
-3. **Key parameters to learn:**
-   - Wind generation forecast error distribution as a function of lead time and weather regime
-   - Solar PV forecast error distribution (cloud cover uncertainty)
-   - Demand forecast error (temperature sensitivity, special events)
-   - Cross-correlations between wind, solar, and demand errors
-   - Imbalance price response function: how price responds to residual demand deviations
-   - Gas plant merit order response: how CCGT/OCGT dispatch responds to residual demand
-
-### 3.2 Renewable scenario generation
-
-For evaluating policies under future grid mixes (e.g., 2030 with ~80% renewables), perturb the learned model by scaling installed wind and solar capacity while preserving the stochastic structure. This is analogous to using UKCP18 change factors in the flood project — same dynamics, different forcing.
-
-### 3.3 Validation strategy
-
-- **Temporal holdout:** Train on 2020–2023, validate on 2024–2025. Key test: does the model reproduce the distribution of imbalance prices and wind forecast errors, not just means?
-- **Event reproduction:** Test on known stress events — e.g., the low-wind periods of September 2021 ("wind drought"), cold snaps with high demand, or periods of high curtailment.
-- **Price distribution:** Validate that simulated price distributions match the heavy-tailed empirical distribution of imbalance prices (this is where deterministic models fail).
-
----
-
-## Phase 4: Decision Science Layer
-
-### 4.1 Policy actions to evaluate
-
-The decision science layer evaluates storage dispatch and demand response strategies:
-
-| Policy type | Description | Decision variables |
-|-------------|-------------|-------------------|
-| **Price-threshold dispatch** | Charge below price P₁, discharge above P₂ | Threshold values P₁, P₂ |
-| **Forecast-based dispatch** | Charge when wind forecast high / demand forecast low; discharge on inverse | Forecast lead time, trigger levels |
-| **Carbon-minimising dispatch** | Charge during low-carbon periods, discharge to displace gas | Carbon intensity thresholds |
-| **Stacked services** | Combine energy arbitrage with frequency response and reserve provision | Allocation fractions across services |
-| **Demand response scheduling** | Shift EV charging and heat pump operation to low-carbon/low-price periods | Flexibility window, shift magnitude |
-| **Combined storage + DR** | Coordinated battery and demand-side actions | Joint optimisation of both levers |
-
-### 4.2 The forecast uncertainty problem
-
-The central insight is that optimal dispatch depends on forecast accuracy, which degrades with lead time. A deterministic dispatch that charges at 2am based on a "wind will be high tomorrow" forecast is brittle — if the wind doesn't materialise, the battery is full when it shouldn't be. Stochastic ensemble dispatch naturally handles this by evaluating policies across the distribution of outcomes, not just the point forecast.
-
-### 4.3 Objective function
-
-For each dispatch policy, simulate multiple trajectories and evaluate:
-
-- **Primary outcome:** Expected net cost (balancing cost reduction minus battery degradation cost) over 1 year
-- **Secondary outcomes:** Carbon intensity reduction (gCO₂/kWh avoided), renewable curtailment avoided (MWh), number of price spikes mitigated
-- **Robustness metric:** Performance in worst-case scenarios (e.g., 95th percentile cost during "wind drought" weeks)
-- **Future-proofing:** Performance under 2030 grid mix with higher wind/solar penetration
-
-### 4.4 Output
-
-For a given battery installation and grid scenario, produce actionable recommendations:
-
-> *"For a 100MW/200MWh battery operating in the 2025 GB market, a forecast-based dispatch strategy with 6-hour look-ahead outperforms simple price-threshold dispatch by 23% on expected annual revenue, primarily by better anticipating wind ramps. Under a 2030 grid mix with 60GW wind capacity, the same strategy reduces system carbon intensity by 4.2 gCO₂/kWh on average, with the largest impact during autumn evening peaks. Adding coordinated EV charging demand response (shifting 2GW of flexible load by ±4 hours) provides a further 15% reduction in balancing cost."*
-
----
-
-## Phase 5: Extensions
-
-1. **Regional disaggregation:** Model by DNO area using regional carbon intensity and PV_Live regional data, capturing constraint costs from transmission bottlenecks (a major and growing cost in GB)
-2. **Multi-storage coordination:** Model a portfolio of batteries at different locations with different durations, optimising fleet dispatch jointly
-3. **Long-duration storage:** Extend to hydrogen electrolysis and storage, addressing multi-day and seasonal storage for "wind drought" events that last a week or more
-4. **Vehicle-to-grid (V2G):** Model EV batteries as distributed storage with driving constraints, evaluating V2G as a grid flexibility resource
-5. **Market simulation:** Add wholesale market bidding dynamics — simulate strategic behaviour of storage operators competing in the day-ahead and balancing markets
-6. **Real-time operational tool:** Connect to live NESO and Elexon APIs for rolling-horizon dispatch optimisation with continuously updated stochastic forecasts
-
----
-
-## Implementation Status
-
-Phases 1–4 are implemented and working end-to-end. The four `cmd/` commands form the pipeline:
-
-| Command | Phase | Status | Description |
-|---------|-------|--------|-------------|
-| `cmd/ingest` | 1 | ✅ Done | Downloads NESO historic demand CSV to `dat/demand.csv` |
-| `cmd/simulate` | 2 | ✅ Done | Runs full stochastic grid simulation (OU residual demand, battery SoC, imbalance price, outcomes) |
-| `cmd/infer` | 3 | ✅ Done | Infers OU parameters from observed data: OLS (fast) + SMC Bayesian (optional) |
-| `cmd/evaluate` | 4 | ✅ Done | Evaluates battery dispatch policies against simulated outcomes |
-
-**stochadex version:** `v0.0.0-20260330061034-1555b7d4e430`
-
-### Inference pipeline (`cmd/infer`)
-
-Three steps in sequence:
-
-1. **Data replay** — runs a stochadex simulation over `dat/demand.csv` storing `residual_demand`, `conditional_mean`, and `lagged_residual_demand` via `analysis.NewStateTimeStorageFromPartitions`.
-2. **OLS estimation** — uses `analysis.NewScalarRegressionStatsPartition` to stream cumulative regression of ΔX = X_next − X_prev on d = μ − X_prev (no intercept). Recovers OU parameters: θ = −ln(1−β)/Δ, σ² from residual variance formula.
-3. **SMC Bayesian inference** (optional, `-smc` flag) — `analysis.RunSMCInference` with N particles, each evaluated against the exact OU transition log-likelihood over all T data steps. Priors are TruncatedNormal in log(θ), log(σ) space, centred on OLS estimates.
-
-Example results on 6 weeks of NESO half-hourly demand:
 ```
-OLS:  theta = 0.2403/half-hour,  sigma = 1591.42 MW/√(half-hour)
-SMC:  theta = 0.2356 ± 0.011,    sigma = 1588.57 ± 18.85 MW/√(half-hour)
+X(t+Δ) = X(t) + (1 - exp(-θΔ)) · (μ(t) - X(t)) + ε
+
+where ε ~ N(0, σ²(1 - exp(-2θΔ)) / 2θ)
+```
+
+`X(t)` is residual demand, `μ(t)` is the conditional mean for the current settlement period, θ is the mean-reversion speed, and σ is the diffusion coefficient. Inference runs in three steps:
+
+**Step 1 — Data replay.** A stochadex simulation replays the demand CSV, computing and storing `residual_demand`, `conditional_mean`, and `lagged_residual_demand` in a `StateTimeStorage`.
+
+**Step 2 — OLS estimation.** The OU transition implies a no-intercept linear regression. Defining `ΔX = X(t+Δ) - X(t)` and `d = μ(t) - X(t)`:
+
+```
+ΔX = β · d + ε,   β = 1 - exp(-θΔ)
+```
+
+`analysis.NewScalarRegressionStatsPartition` streams cumulative OLS over the replayed data. The OU parameters recover as:
+
+```
+θ = -ln(1-β) / Δ
+σ = sqrt(2θ · Var(residual) / (1 - exp(-2θΔ)))
+```
+
+**Step 3 — SMC Bayesian inference** (optional, `-smc` flag). `analysis.RunSMCInference` runs sequential Monte Carlo with N particles, each evaluated against the exact OU transition log-likelihood (`OUTransitionLikelihood`) over all T data steps. Parameters are inferred in log-space (`log θ`, `log σ`) for numerical stability. Priors are truncated normals centred on the OLS estimates.
+
+### Stage 3 — Stochastic Simulation (`cmd/simulate`)
+
+Runs a forward simulation given inferred parameters and a chosen dispatch policy. The simulation is a stochadex partition graph:
+
+```
+grid_data (CSV replay)
+    └──▶ residual_demand  (ND - wind × scale - solar × scale)
+              └──▶ imbalance_price  (linear response + OU noise)
+                        └──▶ dispatch_policy  (price or carbon threshold)
+                                  └──▶ battery  (SoC, actual dispatch)
+                                            ├──▶ degradation  (cumulative EFC)
+                                            └──▶ revenue, carbon_savings
+carbon_data (CSV replay)
+    └──▶ dispatch_policy  (carbon threshold variant)
+```
+
+Each partition implements the stochadex `Iteration` interface and is called every half-hour step (Δ = 0.5 hours).
+
+**Residual demand** replays the observed demand, wind, and solar from the NESO CSV. Optional `wind_scale` and `solar_scale` multipliers enable scenario analysis:
+
+```
+residual_demand = ND - embedded_wind × wind_scale - embedded_solar × solar_scale
+```
+
+**Imbalance price** is a structural linear model plus mean-reverting noise:
+
+```
+price(t) = 0.002 × residual_demand(t) - 10 + noise(t)
+```
+
+The slope (0.002 £/MWh per MW) and intercept (-10 £/MWh) reproduce typical GB price levels of £30–50/MWh at moderate residual demand. The noise is an OU process (θ=2, σ=5) capturing intra-period price volatility.
+
+**Battery** tracks state of charge (SoC) subject to physical constraints:
+
+| Parameter | Default |
+|---|---|
+| Energy capacity | 200 MWh |
+| Power rating | 100 MW |
+| Charge efficiency | 92% (one-way) |
+| Discharge efficiency | 92% (one-way) |
+| Min SoC | 10% of capacity |
+| Max SoC | 90% of capacity |
+
+Round-trip efficiency is 0.92² ≈ 85%. SoC limits are enforced by back-calculating the actual dispatch when a limit would be breached.
+
+**Degradation** accumulates equivalent full cycles (EFC):
+
+```
+EFC per step = |actual_dispatch_mw × dt| / (2 × capacity_mwh)
+```
+
+**Revenue** and **carbon savings** accumulate:
+
+```
+revenue per step (£)     = actual_dispatch_mw × price (£/MWh) × dt (hours)
+carbon saved per step (tCO₂) = max(dispatch, 0) × dt × carbon_intensity (gCO₂/kWh) / 1000
+```
+
+Output is written as a JSON log (default `dat/simulation.log`).
+
+### Stage 4 — Policy Evaluation (`cmd/evaluate`)
+
+Runs all four combinations of two dispatch policies × two grid scenarios, printing a summary table and optionally exporting per-step time-series CSVs.
+
+**Dispatch policies:**
+
+| Policy | Logic |
+|---|---|
+| Price threshold | Discharge at full power when price > £45/MWh; charge when price < £25/MWh |
+| Carbon threshold | Discharge when carbon intensity > 250 gCO₂/kWh; charge when < 100 gCO₂/kWh |
+
+Both are stateless — they respond only to the current price or carbon reading with no look-ahead.
+
+**Grid scenarios:**
+
+| Scenario | Wind scale | Solar scale | Rationale |
+|---|---|---|---|
+| 2025 (current grid) | 1.0× | 1.0× | Baseline: ~28 GW wind, ~15 GW solar installed |
+| 2030 (Holistic Transition) | 2.1× | 2.0× | NESO FES: ~60 GW wind, ~30 GW solar |
+
+**Net value** is the primary outcome metric:
+
+```
+net_value = cumulative_revenue - EFC × cost_per_cycle
+```
+
+Default degradation cost is £8,000 per EFC, calibrated to typical BESS CAPEX amortisation.
+
+### Stage 5 — Visualisation (`cmd/plot`)
+
+Runs all four evaluations and renders an interactive HTML dashboard via the stochadex `analysis` plotting package (backed by [go-echarts](https://github.com/go-echarts/go-echarts)).
+
+The dashboard contains four charts:
+
+| Chart | Type | Description |
+|---|---|---|
+| Battery SoC — first week | Line | Charging/discharging patterns over the first 168 hours |
+| Cumulative revenue | Line | Long-run revenue divergence across scenarios and policies |
+| Residual demand: 2025 vs 2030 | Line | Time series showing the demand shift from wind/solar scaling |
+| Price vs residual demand (2025) | Scatter | The structural price response and noise |
+
+Charts are interactive — hover to read values, scroll to zoom, drag to pan. The plots use `analysis.NewLinePlotFromDataFrame` and `analysis.NewScatterPlotFromPartition`, operating directly on `StateTimeStorage` objects without intermediate files.
+
+---
+
+## Quick Start
+
+### Prerequisites
+
+- Go 1.22+
+
+```bash
+git clone https://github.com/umbralcalc/energy-balancer
+cd energy-balancer
+go build ./...
+```
+
+### Full pipeline
+
+```bash
+# 1. Fetch data (downloads ~200 MB; takes a few minutes)
+go run ./cmd/ingest -from 2020-01-01 -to 2025-12-31
+
+# 2. Infer OU parameters
+go run ./cmd/infer -data dat/demand.csv
+# Add -smc for full Bayesian estimates:
+go run ./cmd/infer -data dat/demand.csv -smc -particles 200 -rounds 20
+
+# 3. Run a single forward simulation and inspect the log
+go run ./cmd/simulate \
+  -data dat/demand.csv \
+  -carbon dat/carbon_intensity.csv \
+  -policy price
+
+# 4. Compare all policies and scenarios
+go run ./cmd/evaluate \
+  -data dat/demand.csv \
+  -carbon dat/carbon_intensity.csv \
+  -out dat/results
+
+# 5. Generate interactive dashboard
+go run ./cmd/plot \
+  -data dat/demand.csv \
+  -carbon dat/carbon_intensity.csv \
+  -out dat/plots/evaluation.html
+```
+
+Open `dat/plots/evaluation.html` in any browser.
+
+### Run tests
+
+```bash
+go test -count=1 ./...
 ```
 
 ---
 
-## Concrete First Steps
+## Command Reference
 
-### Week 1–2: Data acquisition and exploration
+### `cmd/ingest`
 
-- [x] Pull historic demand data from NESO Data Portal (2020–2025, half-hourly) — `cmd/ingest`
-- [ ] Pull generation by fuel type from NESO (historic generation mix)
-- [ ] Pull PV generation from Sheffield Solar PV_Live API (national, half-hourly, 2020–2025)
-- [ ] Pull carbon intensity time series from the Carbon Intensity API
-- [ ] Register for Elexon and pull imbalance prices (B1770) and volumes (B1780)
-- [ ] Exploratory analysis: characterise the joint distribution of wind, solar, demand, and price; identify correlation structure, seasonal patterns, and tail behaviour
+| Flag | Default | Description |
+|---|---|---|
+| `-from` | `2020-01-01` | Start date (YYYY-MM-DD) |
+| `-to` | `2025-12-31` | End date |
+| `-out` | `dat` | Output directory |
+| `-source` | `all` | `all`, `carbon`, `generation`, `solar`, or `demand` |
 
-### Week 3–4: Minimal stochadex simulation
+### `cmd/infer`
 
-- [x] Implement a stochastic residual demand model: demand − wind − solar, with learned marginal distributions and correlation structure — `cmd/simulate` with OU process
-- [x] Implement a simple price response model: imbalance price as a stochastic function of residual demand — `pkg/grid/imbalance_price.go`
-- [x] Add a single-battery state tracker with SoC, power limits, and efficiency losses — `pkg/grid/battery.go`
-- [x] Verify the simulation reproduces qualitatively sensible half-hourly dynamics over a week
+| Flag | Default | Description |
+|---|---|---|
+| `-data` | `dat/demand.csv` | NESO demand CSV |
+| `-steps` | `2016` | Steps to fit over (~6 weeks) |
+| `-smc` | false | Also run SMC Bayesian inference |
+| `-particles` | `200` | SMC particle count |
+| `-rounds` | `20` | SMC rounds |
 
-### Week 5–6: Simulation-based inference
+### `cmd/simulate`
 
-- [x] Smooth and aggregate observed demand data into conditional mean by time-of-day and day-of-week — `pkg/grid/conditional_mean.go`
-- [x] Set up OLS + SMC Bayesian inference to learn OU model parameters from observed data — `cmd/infer`
-- [ ] Validate: does the simulated price distribution match the empirical heavy-tailed distribution? Does the wind forecast error structure look realistic?
+| Flag | Default | Description |
+|---|---|---|
+| `-data` | `dat/demand.csv` | NESO demand CSV |
+| `-carbon` | `dat/carbon_intensity.csv` | Carbon intensity CSV |
+| `-policy` | `price` | `price` or `carbon` |
+| `-steps` | `0` | Steps (0 = full dataset) |
+| `-out` | `dat/simulation.log` | Output JSON log |
+| `-capacity` | `200.0` | Battery capacity (MWh) |
+| `-rating` | `100.0` | Battery power rating (MW) |
+| `-price-high` | `45.0` | Discharge threshold (£/MWh) |
+| `-price-low` | `25.0` | Charge threshold (£/MWh) |
+| `-carbon-high` | `250.0` | Discharge threshold (gCO₂/kWh) |
+| `-carbon-low` | `100.0` | Charge threshold (gCO₂/kWh) |
 
-### Week 7–8: Decision science layer
+### `cmd/evaluate`
 
-- [x] Implement candidate dispatch policies (price-threshold battery dispatch) — `pkg/grid/battery.go`
-- [x] Run policy evaluation: simulate ensembles and compute outcome statistics — `cmd/evaluate`
-- [ ] Scale wind/solar capacity to 2030 levels and re-evaluate
-- [ ] Produce initial findings and visualisations
-- [ ] Write up as a blog post in the "Engineering Smart Actions in Practice" series
+| Flag | Default | Description |
+|---|---|---|
+| `-data` | `dat/demand.csv` | NESO demand CSV |
+| `-carbon` | `dat/carbon_intensity.csv` | Carbon intensity CSV |
+| `-steps` | `17520` | Steps (17520 = 1 year) |
+| `-capacity` | `200.0` | Battery capacity (MWh) |
+| `-rating` | `100.0` | Battery power rating (MW) |
+| `-price-high` | `45.0` | Price policy discharge threshold (£/MWh) |
+| `-price-low` | `25.0` | Price policy charge threshold (£/MWh) |
+| `-carbon-high` | `250.0` | Carbon policy discharge threshold (gCO₂/kWh) |
+| `-carbon-low` | `100.0` | Carbon policy charge threshold (gCO₂/kWh) |
+| `-cost-per-cycle` | `8000.0` | Degradation cost per EFC (£) |
+| `-wind-scale-2030` | `2.1` | 2030 wind capacity scale factor |
+| `-solar-scale-2030` | `2.0` | 2030 solar capacity scale factor |
+| `-out` | `` | Directory for per-run time-series CSVs (skipped if empty) |
+
+### `cmd/plot`
+
+Accepts the same flags as `cmd/evaluate` plus:
+
+| Flag | Default | Description |
+|---|---|---|
+| `-out` | `dat/plots/evaluation.html` | Output HTML file |
 
 ---
 
-## Key Data Sources Summary
+## Project Structure
 
-| Source | URL | Data type | Access |
-|--------|-----|-----------|--------|
-| NESO Data Portal | data.nationalgrideso.com | Generation mix, demand, wind/solar forecasts, balancing costs, constraint data | Free download, API |
-| Carbon Intensity API | api.carbonintensity.org.uk | National/regional carbon intensity + generation mix, HH, 96hr forecast | Free REST API, no registration |
-| Sheffield Solar PV_Live | solar.sheffield.ac.uk/pvlive/ | GB solar PV generation estimates (national + regional by GSP), HH from 2013 | Free API, CC BY 4.0 |
-| Elexon BMRS | bmrs.elexon.co.uk | Imbalance prices, volumes, generation by fuel type, BM actions, market data | Free API with registration |
-| Met Office DataPoint | metoffice.gov.uk/services/data | Weather forecasts and observations (wind, solar radiation, temperature) | Free tier with registration |
-| NESO Future Energy Scenarios | nationalgrideso.com/future-energy | Scenario data for 2030/2040/2050 grid mixes, demand projections | Free download |
-| Energy Dashboard | energydashboard.co.uk | Aggregated live and historic generation data from Elexon + NESO + PV_Live | Free web access |
+```
+cmd/
+  ingest/     — data download: NESO, Carbon Intensity API, Sheffield Solar PV_Live
+  infer/      — OU parameter estimation: OLS + optional SMC
+  simulate/   — single forward simulation → JSON log
+  evaluate/   — 4-way policy × scenario comparison + optional CSV export
+  plot/       — interactive HTML dashboard via stochadex analysis plotting package
+pkg/grid/
+  grid_data.go            — GridDataIteration: replays ND, wind, solar from CSV
+  residual_demand.go      — ResidualDemandIteration: ND - wind×scale - solar×scale
+  conditional_mean.go     — ConditionalMeanIteration: historical mean by settlement period
+  lagged.go               — LaggedValuesIteration: one-step delayed values for OLS
+  difference.go           — ScalarDifferenceIteration: a - b (ΔX and d for OLS)
+  ou_transition.go        — OUTransitionLikelihood: exact log-likelihood for SMC
+  imbalance_price.go      — ImbalancePriceIteration: linear demand response + OU noise
+  dispatch_policy.go      — PriceThresholdDispatchIteration, CarbonThresholdDispatchIteration
+  carbon_data.go          — CarbonDataIteration: replays actual/forecast intensity from CSV
+  battery.go              — BatteryIteration: SoC tracker with efficiency and SoC limits
+  battery_degradation.go  — BatteryDegradationIteration: cumulative EFC accumulator
+  outcomes.go             — RevenueIteration, CarbonSavingsIteration
+dat/
+  demand.csv              — NESO half-hourly national demand (from cmd/ingest)
+  carbon_intensity.csv    — carbon intensity, actual + forecast (from cmd/ingest)
+  generation_mix.csv      — generation mix by fuel type (from cmd/ingest)
+  solar_pv.csv            — Sheffield Solar national PV estimates (from cmd/ingest)
+  results/                — per-run time-series CSVs (from cmd/evaluate -out)
+  plots/                  — HTML dashboard (from cmd/plot)
+```
 
 ---
 
-## References and Related Work
+## Results
 
-- PyPSA-GB — open-source model of GB power system for simulating future energy scenarios, including storage and demand-side management (University of Edinburgh, 2024)
-- SDED-S framework — stochastic dynamic economic dispatch with battery storage, demonstrating cost savings increase sharply beyond 30% renewable penetration (arXiv, 2025)
-- UK BESS market analysis — modelling optimal battery dispatch across day-ahead, intraday, frequency response and imbalance settlement in the UK market structure (ScienceDirect, 2024)
-- NESO Demand Flexibility Service (DFS) — real operational data on consumer demand response during peak winter periods, available from NESO data portal
-- NESO Future Energy Scenarios (FES) — official scenarios for GB energy system evolution to 2050, providing the basis for scaling renewable capacity in future scenarios
+### Inference
+
+On approximately six weeks of NESO half-hourly data, OLS and SMC agree closely:
+
+```
+OLS:  theta = 0.2403 /half-hour    sigma = 1591.42 MW/√(half-hour)
+SMC:  theta = 0.2356 ± 0.011       sigma = 1588.57 ± 18.85 MW/√(half-hour)
+```
+
+The mean-reversion speed θ ≈ 0.24/half-hour corresponds to a half-life of approximately 1.4 hours: shocks to residual demand (forecast errors, unexpected plant trips, demand spikes) decay on an hourly timescale, consistent with the known intraday autocorrelation structure of GB net demand.
+
+The tight agreement between OLS and SMC validates the Gaussian assumption. Six weeks of data is sufficient to pin down both parameters to within a few percent, with the SMC posterior uncertainty confirming the OLS point estimates are reliable.
+
+### Policy evaluation
+
+The evaluation compares two threshold strategies over a representative year (17,520 half-hour steps) for a 100 MW / 200 MWh battery, across both 2025 and 2030 grid scenarios. Run `cmd/evaluate` with downloaded data to get quantitative outcomes for your chosen parameters.
+
+**2025 — current grid.** The price-threshold policy operates during periods of high price volatility driven by residual demand swings. With thresholds of £45/MWh (discharge) and £25/MWh (charge), the battery participates in roughly 15–20% of settlement periods. The carbon-threshold policy (>250 gCO₂/kWh discharge, <100 gCO₂/kWh charge) is more selective: the GB grid typically sits between these thresholds for much of the year, particularly during periods of moderate renewable output, so the battery cycles less frequently.
+
+**2030 — Holistic Transition.** Scaling wind by 2.1× and solar by 2.0× substantially reduces mean residual demand. This has two effects: (i) lower mean residual demand compresses average prices, reducing price-arbitrage revenue; (ii) the carbon intensity distribution becomes more bimodal — frequent low-carbon periods when wind is high, punctuated by high-carbon periods during wind droughts — which sharpens the signal for carbon-threshold dispatch.
+
+The 2030 scenario therefore tends to favour the carbon-threshold policy relative to the price-threshold policy: it dispatches against a cleaner signal, while the price-threshold policy faces a less favourable arbitrage spread. The residual demand plot from `cmd/plot` shows this shift directly: the 2030 time series is systematically lower and exhibits more frequent excursions toward generation surplus, precisely the conditions under which storage charging provides the most system value.
+
+---
+
+## Extending the Model
+
+Several natural extensions are straightforward within the stochadex framework:
+
+**Actual imbalance price data.** Register with [Elexon BMRS](https://bmrs.elexon.co.uk) and add an iteration that replays the B1770 system price series. This replaces the structural linear price model with observed prices, enabling direct revenue validation and threshold calibration against real market outcomes.
+
+**Wind forecast error.** Add a partition that replays NESO day-ahead wind forecasts alongside outturn. Modelling the forecast error distribution enables look-ahead policies that hedge against uncertainty rather than responding reactively to current conditions.
+
+**Multi-battery fleet.** Replicate the dispatch/battery/degradation/revenue subgraph N times with different capacity, location, and contract parameters. The stochadex partition graph scales naturally.
+
+**Long-duration storage.** Extend the battery model to multi-hour or multi-day storage durations to address the wind drought problem — periods of several days with low wind that simple BESS cannot bridge.
+
+**Regional disaggregation.** The Carbon Intensity API provides regional intensity by Grid Supply Point. A regional carbon partition enables location-aware dispatch that responds to local constraint costs, a growing source of balancing expenditure in GB.
+
+---
+
+## Data Sources
+
+| Source | Data | Access |
+|---|---|---|
+| [NESO Data Portal](https://data.nationalgrideso.com) | Historic demand, embedded wind/solar, 2020–2025 | Free, no registration |
+| [Carbon Intensity API](https://api.carbonintensity.org.uk) | Carbon intensity (actual + forecast) and generation mix | Free REST API, no registration |
+| [Sheffield Solar PV_Live](https://api0.solar.sheffield.ac.uk/pvlive/) | National solar PV generation (MW), half-hourly from 2013 | Free API, CC BY 4.0 |
+| [Elexon BMRS](https://bmrs.elexon.co.uk) | Imbalance prices (B1770), balancing mechanism actions | Free with registration |
+
+---
+
+## Dependencies
+
+| Package | Role |
+|---|---|
+| [umbralcalc/stochadex](https://github.com/umbralcalc/stochadex) | Simulation engine, analysis tools, SMC inference, plotting |
+| [go-echarts/go-echarts](https://github.com/go-echarts/go-echarts) | Interactive HTML charts (via stochadex analysis) |
+| [go-gota/gota](https://github.com/go-gota/gota) | DataFrames for grouped plot construction |
+| [gonum.org/v1/gonum](https://gonum.org) | Numerical operations |

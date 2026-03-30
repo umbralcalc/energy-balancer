@@ -1,6 +1,5 @@
-# Data files (large CSVs from API ingestion)
-dat/*.csv
-dat/*.log
+# Data files
+dat/*
 
 ingest
 !cmd/ingest/
@@ -13,3 +12,6 @@ evaluate
 
 infer
 !cmd/infer/
+
+plot
+!cmd/plot/

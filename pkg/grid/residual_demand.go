@@ -16,7 +16,15 @@ import (
 //
 //	[residual_demand_mw]
 //
-// where residual_demand = national_demand - embedded_wind - embedded_solar.
+// where residual_demand = national_demand - wind*wind_scale - solar*solar_scale.
+//
+// Optional params:
+//
+//	wind_scale  [dimensionless] - multiply embedded wind by this factor (default 1.0)
+//	solar_scale [dimensionless] - multiply embedded solar by this factor (default 1.0)
+//
+// Set wind_scale > 1 and solar_scale > 1 to simulate future grid mixes with
+// higher renewable penetration (e.g. 2030 Holistic Transition scenario: 2.1, 2.0).
 type ResidualDemandIteration struct {
 	upstreamPartitionIndex int
 }
@@ -36,10 +44,19 @@ func (r *ResidualDemandIteration) Iterate(
 	stateHistories []*simulator.StateHistory,
 	timestepsHistory *simulator.CumulativeTimestepsHistory,
 ) []float64 {
+	windScale := 1.0
+	if v, ok := params.Map["wind_scale"]; ok {
+		windScale = v[0]
+	}
+	solarScale := 1.0
+	if v, ok := params.Map["solar_scale"]; ok {
+		solarScale = v[0]
+	}
+
 	upstream := stateHistories[r.upstreamPartitionIndex]
 	demand := upstream.Values.At(0, 0)
 	wind := upstream.Values.At(0, 1)
 	solar := upstream.Values.At(0, 2)
-	residual := demand - wind - solar
+	residual := demand - wind*windScale - solar*solarScale
 	return []float64{residual}
 }

@@ -1,23 +1,20 @@
 package main
 
 import (
-	"encoding/csv"
 	"flag"
-	"fmt"
 	"log"
 	"os"
-	"path/filepath"
-	"strconv"
-	"strings"
 
+	"github.com/go-echarts/go-echarts/v2/components"
+	"github.com/go-gota/gota/dataframe"
+	"github.com/go-gota/gota/series"
 	"github.com/umbralcalc/energy-balancer/pkg/grid"
+	"github.com/umbralcalc/stochadex/pkg/analysis"
 	"github.com/umbralcalc/stochadex/pkg/continuous"
 	"github.com/umbralcalc/stochadex/pkg/simulator"
 )
 
-// Partition indices — identical for both policy runs.
-// The only difference between price and carbon policies is partition 5
-// (dispatch_policy), which is either PriceThreshold or CarbonThreshold.
+// Partition indices — must match the order in buildSettings.
 const (
 	idxGridData      = 0
 	idxResidual      = 1
@@ -31,16 +28,12 @@ const (
 	idxCarbonSavings = 9
 )
 
-type policyResult struct {
-	revenue     float64 // cumulative revenue in £
-	carbonTco2  float64 // carbon displaced in tCO₂
-	efc         float64 // equivalent full cycles
-	netValue    float64 // revenue minus degradation cost
-}
+// weekSteps is the number of half-hourly steps in one week.
+const weekSteps = 48 * 7
 
 func buildSettings(
-	priceHigh, priceLow, carbonHigh, carbonLow, ratingMW, capacityMWh,
-	windScale, solarScale float64,
+	priceHigh, priceLow, carbonHigh, carbonLow,
+	ratingMW, capacityMWh, windScale, solarScale float64,
 	isPricePolicy bool,
 ) *simulator.Settings {
 	var dispatchParams simulator.Params
@@ -59,7 +52,6 @@ func buildSettings(
 			"power_rating_mw":  {ratingMW},
 		})
 	}
-
 	return &simulator.Settings{
 		Iterations: []simulator.IterationSettings{
 			{
@@ -181,8 +173,7 @@ func buildSettings(
 	}
 }
 
-func buildIterations(dataPath, carbonPath string, isPricePolicy bool) ([]simulator.Iteration, *grid.GridDataIteration) {
-	gridIter := &grid.GridDataIteration{CsvPath: dataPath}
+func buildIterations(dataPath, carbonPath string, isPricePolicy bool) []simulator.Iteration {
 	var dispatch simulator.Iteration
 	if isPricePolicy {
 		dispatch = &grid.PriceThresholdDispatchIteration{}
@@ -190,7 +181,7 @@ func buildIterations(dataPath, carbonPath string, isPricePolicy bool) ([]simulat
 		dispatch = &grid.CarbonThresholdDispatchIteration{}
 	}
 	return []simulator.Iteration{
-		gridIter,
+		&grid.GridDataIteration{CsvPath: dataPath},
 		&grid.ResidualDemandIteration{},
 		&continuous.OrnsteinUhlenbeckIteration{},
 		&grid.ImbalancePriceIteration{},
@@ -200,7 +191,7 @@ func buildIterations(dataPath, carbonPath string, isPricePolicy bool) ([]simulat
 		&grid.BatteryDegradationIteration{},
 		&grid.RevenueIteration{},
 		&grid.CarbonSavingsIteration{},
-	}, gridIter
+	}
 }
 
 func runPolicy(
@@ -225,91 +216,57 @@ func runPolicy(
 	return store
 }
 
-// slugify turns a human-readable label into a safe filename component.
-func slugify(s string) string {
-	r := strings.NewReplacer(
-		" ", "_", "/", "_", "(", "", ")", "",
-		">", "gt", "<", "lt", "£", "gbp", "×", "x",
+// runEntry pairs a human-readable label with its simulation output.
+type runEntry struct {
+	label string
+	store *simulator.StateTimeStorage
+}
+
+// buildCombinedDF extracts one value index from a named partition across
+// multiple stores and concatenates them into a DataFrame suitable for
+// grouped line/scatter plots.
+func buildCombinedDF(
+	runs []runEntry,
+	partition string,
+	colIdx int,
+	colName string,
+	maxSteps int,
+) dataframe.DataFrame {
+	var times, vals []float64
+	var labels []string
+	for _, r := range runs {
+		allVals := r.store.GetValues(partition)
+		allTimes := r.store.GetTimes()
+		n := len(allVals)
+		if maxSteps > 0 && n > maxSteps {
+			n = maxSteps
+		}
+		for i := 0; i < n; i++ {
+			times = append(times, allTimes[i])
+			vals = append(vals, allVals[i][colIdx])
+			labels = append(labels, r.label)
+		}
+	}
+	return dataframe.New(
+		series.New(times, series.Float, "time_h"),
+		series.New(vals, series.Float, colName),
+		series.New(labels, series.String, "run"),
 	)
-	return strings.ToLower(r.Replace(s))
-}
-
-// writeResultCSV writes per-step time series for a policy run to a CSV file.
-func writeResultCSV(path string, store *simulator.StateTimeStorage) error {
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	w := csv.NewWriter(f)
-	defer w.Flush()
-
-	w.Write([]string{
-		"step", "time_h",
-		"residual_demand_mw", "imbalance_price_gbp_mwh", "carbon_gco2_kwh",
-		"soc_mwh", "actual_dispatch_mw",
-		"cumulative_revenue_gbp", "cumulative_carbon_tco2", "cumulative_efc",
-	})
-
-	residual := store.GetValues("residual_demand")
-	price := store.GetValues("imbalance_price")
-	carbon := store.GetValues("carbon_data")
-	battery := store.GetValues("battery")
-	degradation := store.GetValues("degradation")
-	revenue := store.GetValues("revenue")
-	carbonSavings := store.GetValues("carbon_savings")
-
-	n := len(residual)
-	ff := func(v float64) string { return strconv.FormatFloat(v, 'f', 4, 64) }
-	for i := 0; i < n; i++ {
-		w.Write([]string{
-			strconv.Itoa(i),
-			ff(float64(i) * 0.5),
-			ff(residual[i][0]),
-			ff(price[i][0]),
-			ff(carbon[i][0]),
-			ff(battery[i][0]),
-			ff(battery[i][1]),
-			ff(revenue[i][0]),
-			ff(carbonSavings[i][0]),
-			ff(degradation[i][0]),
-		})
-	}
-	return nil
-}
-
-func extractResult(store *simulator.StateTimeStorage, capacityMWh, costPerCycle float64) policyResult {
-	last := func(name string) float64 {
-		vals := store.GetValues(name)
-		return vals[len(vals)-1][0]
-	}
-	efc := last("degradation")
-	revenue := last("revenue")
-	return policyResult{
-		revenue:    revenue,
-		carbonTco2: last("carbon_savings"),
-		efc:        efc,
-		netValue:   revenue - efc*costPerCycle,
-	}
 }
 
 func main() {
 	dataPath := flag.String("data", "dat/demand.csv", "Path to NESO demand CSV")
 	carbonPath := flag.String("carbon", "dat/carbon_intensity.csv", "Path to carbon intensity CSV")
-	steps := flag.Int("steps", 17520, "Steps to evaluate (default: 1 year = 17520 half-hours)")
+	steps := flag.Int("steps", 17520, "Steps to evaluate (1 year = 17520 half-hours)")
 	capacityMWh := flag.Float64("capacity", 200.0, "Battery energy capacity (MWh)")
 	ratingMW := flag.Float64("rating", 100.0, "Battery power rating (MW)")
 	priceHigh := flag.Float64("price-high", 45.0, "Price policy: discharge threshold £/MWh")
 	priceLow := flag.Float64("price-low", 25.0, "Price policy: charge threshold £/MWh")
 	carbonHigh := flag.Float64("carbon-high", 250.0, "Carbon policy: discharge threshold gCO₂/kWh")
 	carbonLow := flag.Float64("carbon-low", 100.0, "Carbon policy: charge threshold gCO₂/kWh")
-	costPerCycle := flag.Float64("cost-per-cycle", 8000.0, "Battery degradation cost per equivalent full cycle (£)")
-	// 2030 NESO Holistic Transition scenario scaling factors.
-	// Wind: ~28 GW (2024) → ~60 GW (2030) ≈ 2.1×
-	// Solar: ~15 GW (2024) → ~30 GW (2030) ≈ 2.0×
 	windScale2030 := flag.Float64("wind-scale-2030", 2.1, "2030 scenario: wind capacity scale factor")
 	solarScale2030 := flag.Float64("solar-scale-2030", 2.0, "2030 scenario: solar capacity scale factor")
-	outDir := flag.String("out", "", "Directory to write per-run time-series CSVs (skipped if empty)")
+	outPath := flag.String("out", "dat/plots/evaluation.html", "Output HTML file")
 	flag.Parse()
 
 	type scenario struct {
@@ -322,79 +279,94 @@ func main() {
 		{"2030 (Holistic Transition)", *windScale2030, *solarScale2030},
 	}
 
-	log.Printf("Evaluating policies over %d steps (%.1f years)...",
-		*steps, float64(*steps)/17520.0)
-
-	// Determine numSteps once using a throwaway configure on the price-2025 settings.
+	// Determine step count from data length if steps == 0.
 	numSteps := *steps
 	if numSteps == 0 {
 		probe := buildSettings(
-			*priceHigh, *priceLow, *carbonHigh, *carbonLow, *ratingMW, *capacityMWh, 1.0, 1.0, true)
-		probeGrid := &grid.GridDataIteration{CsvPath: *dataPath}
-		probeGrid.Configure(0, probe)
-		numSteps = probeGrid.DataLen() - 1
+			*priceHigh, *priceLow, *carbonHigh, *carbonLow,
+			*ratingMW, *capacityMWh, 1.0, 1.0, true,
+		)
+		g := &grid.GridDataIteration{CsvPath: *dataPath}
+		g.Configure(0, probe)
+		numSteps = g.DataLen() - 1
 	}
 
-	type labelledResult struct {
-		scenario string
-		policy   string
-		result   policyResult
-		store    *simulator.StateTimeStorage
-	}
-	var results []labelledResult
+	log.Printf("Running 4 policy evaluations over %d steps...", numSteps)
 
+	// Run all four scenario/policy combinations.
+	var allRuns []runEntry
+	var priceRuns []runEntry // for residual demand comparison (2025 vs 2030)
 	for _, sc := range scenarios {
-		log.Printf("Scenario: %s (wind×%.1f, solar×%.1f)", sc.label, sc.windScale, sc.solarScale)
+		log.Printf("  Scenario: %s", sc.label)
 
-		log.Println("  Running price-threshold policy...")
-		ps := buildSettings(*priceHigh, *priceLow, *carbonHigh, *carbonLow,
-			*ratingMW, *capacityMWh, sc.windScale, sc.solarScale, true)
-		pi, _ := buildIterations(*dataPath, *carbonPath, true)
-		pStore := runPolicy(ps, pi, numSteps)
-		results = append(results, labelledResult{
-			scenario: sc.label,
-			policy:   fmt.Sprintf("price (>£%.0f / <£%.0f)", *priceHigh, *priceLow),
-			result:   extractResult(pStore, *capacityMWh, *costPerCycle),
-			store:    pStore,
-		})
-
-		log.Println("  Running carbon-threshold policy...")
-		cs := buildSettings(*priceHigh, *priceLow, *carbonHigh, *carbonLow,
-			*ratingMW, *capacityMWh, sc.windScale, sc.solarScale, false)
-		ci, _ := buildIterations(*dataPath, *carbonPath, false)
-		cStore := runPolicy(cs, ci, numSteps)
-		results = append(results, labelledResult{
-			scenario: sc.label,
-			policy:   fmt.Sprintf("carbon (>%dg / <%dg)", int(*carbonHigh), int(*carbonLow)),
-			result:   extractResult(cStore, *capacityMWh, *costPerCycle),
-			store:    cStore,
-		})
-	}
-
-	fmt.Println()
-	fmt.Printf("%-30s  %-30s  %14s  %16s  %8s  %14s\n",
-		"Scenario", "Policy", "Revenue (£)", "Carbon (tCO₂)", "EFC", "Net Value (£)")
-	fmt.Printf("%-30s  %-30s  %14s  %16s  %8s  %14s\n",
-		"------------------------------", "------------------------------",
-		"--------------", "----------------", "--------", "--------------")
-	for _, r := range results {
-		fmt.Printf("%-30s  %-30s  %14.2f  %16.2f  %8.2f  %14.2f\n",
-			r.scenario, r.policy, r.result.revenue, r.result.carbonTco2, r.result.efc, r.result.netValue)
-	}
-	fmt.Println()
-
-	if *outDir != "" {
-		if err := os.MkdirAll(*outDir, 0o755); err != nil {
-			log.Fatalf("creating output dir: %v", err)
-		}
-		for _, r := range results {
-			fname := slugify(r.scenario) + "__" + slugify(r.policy) + ".csv"
-			path := filepath.Join(*outDir, fname)
-			if err := writeResultCSV(path, r.store); err != nil {
-				log.Printf("warning: could not write %s: %v", fname, err)
-			} else {
-				log.Printf("wrote %s", path)
+		for _, isPrice := range []bool{true, false} {
+			policyName := "carbon threshold"
+			if isPrice {
+				policyName = "price threshold"
+			}
+			log.Printf("    Policy: %s", policyName)
+			s := buildSettings(
+				*priceHigh, *priceLow, *carbonHigh, *carbonLow,
+				*ratingMW, *capacityMWh, sc.windScale, sc.solarScale, isPrice,
+			)
+			iters := buildIterations(*dataPath, *carbonPath, isPrice)
+			store := runPolicy(s, iters, numSteps)
+			label := policyName + " — " + sc.label
+			entry := runEntry{label: label, store: store}
+			allRuns = append(allRuns, entry)
+			if isPrice {
+				priceRuns = append(priceRuns, runEntry{label: sc.label, store: store})
 			}
 		}
 	}
+
+	// --- Plot 1: Battery SoC over the first week ---
+	log.Println("Building plot: battery SoC (first week)...")
+	socDF := buildCombinedDF(allRuns, "battery", 0, "soc_mwh", weekSteps)
+	socPlot := analysis.NewLinePlotFromDataFrame(&socDF, "time_h", "soc_mwh", "run")
+
+	// --- Plot 2: Cumulative revenue over the full evaluation window ---
+	log.Println("Building plot: cumulative revenue...")
+	revDF := buildCombinedDF(allRuns, "revenue", 0, "revenue_gbp", 0)
+	revPlot := analysis.NewLinePlotFromDataFrame(&revDF, "time_h", "revenue_gbp", "run")
+
+	// --- Plot 3: Residual demand — 2025 vs 2030 ---
+	// Use only the price-threshold runs so the demand difference is purely
+	// from the wind/solar scaling, not the dispatch policy.
+	log.Println("Building plot: residual demand (2025 vs 2030)...")
+	rdDF := buildCombinedDF(priceRuns, "residual_demand", 0, "residual_demand_mw", 0)
+	rdPlot := analysis.NewLinePlotFromDataFrame(&rdDF, "time_h", "residual_demand_mw", "run")
+
+	// --- Plot 4: Imbalance price vs residual demand — 2025 price-threshold run ---
+	log.Println("Building plot: imbalance price vs residual demand (2025)...")
+	price2025Store := priceRuns[0].store
+	priceScatter := analysis.NewScatterPlotFromPartition(
+		price2025Store,
+		analysis.DataRef{
+			PartitionName: "residual_demand",
+			ValueIndices:  []int{0},
+		},
+		[]analysis.DataRef{
+			{
+				PartitionName: "imbalance_price",
+				ValueIndices:  []int{0},
+			},
+		},
+	)
+
+	// Render all four charts into a single HTML page.
+	if err := os.MkdirAll("dat/plots", 0o755); err != nil {
+		log.Fatalf("creating output dir: %v", err)
+	}
+	page := components.NewPage()
+	page.AddCharts(socPlot, revPlot, rdPlot, priceScatter)
+	f, err := os.Create(*outPath)
+	if err != nil {
+		log.Fatalf("creating output file: %v", err)
+	}
+	defer f.Close()
+	if err := page.Render(f); err != nil {
+		log.Fatalf("rendering page: %v", err)
+	}
+	log.Printf("saved %s", *outPath)
 }
