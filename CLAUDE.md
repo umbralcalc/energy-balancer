@@ -141,3 +141,79 @@ go run github.com/umbralcalc/stochadex/cmd/stochadex --config cfg/builtin_exampl
 ### kernels (github.com/umbralcalc/stochadex/pkg/kernels)
 
 Kernels are not iterations — they implement `IntegrationKernel` and are used by iterations like `ValuesFunctionVectorMeanIteration`. Available: `ConstantIntegrationKernel`, `ExponentialIntegrationKernel`, `PeriodicIntegrationKernel`, `GaussianStateIntegrationKernel`, `TDistributionStateIntegrationKernel`, `BinnedIntegrationKernel`, `ProductIntegrationKernel`, `InstantaneousIntegrationKernel`.
+
+## Project-Specific Iterations (`pkg/grid`)
+
+| Iteration | Params | Description |
+|-----------|--------|-------------|
+| `GridDataIteration` | (reads CSV at `CsvPath`) | Streams NESO demand CSV: [total_demand, wind_solar, period_index] |
+| `ResidualDemandIteration` | `upstream_partition` (via ParamsAsPartitions) | Computes residual demand = total_demand − wind_solar |
+| `ConditionalMeanIteration` | (reads CSV at `CsvPath`) | Returns historical half-hourly mean demand for the current settlement period |
+| `LaggedValuesIteration` | `source_partition` (via ParamsAsPartitions) | Returns the previous step's value of the source partition (reads row 0 of stateHistories before UpdateHistory runs) |
+| `ScalarDifferenceIteration` | `a`, `b` (via ParamsFromUpstream) | Returns `[a − b]`. Stateless. Used to build OLS regression inputs ΔX and d. |
+| `OUTransitionLikelihood` | `thetas` (log θ), `sigmas` (log σ), `mus`, `previous_state` (via ParamsFromUpstream) | Exact OU transition log-likelihood. Params are **log-scale**: internally does exp(). Guards invalid params with std=−1 → −∞ loglike. |
+| `BatteryIteration` | `capacity_mwh`, `max_power_mw`, `efficiency`, dispatch threshold params | Battery SoC tracker with charge/discharge logic |
+| `ImbalancePriceIteration` | `upstream_partition` (via ParamsAsPartitions) | Imbalance price as function of residual demand |
+| `OutcomesIteration` | various upstream partitions | Computes per-step balancing cost, carbon, curtailment outcomes |
+
+## Analysis Package Tools Used
+
+**stochadex version:** `v0.0.0-20260330061034-1555b7d4e430`
+
+### `analysis.NewStateTimeStorageFromPartitions`
+Runs a complete simulation and stores all partition state histories. Used in `cmd/infer` Step 1 to replay observed demand data.
+
+### `analysis.AddPartitionsToStateTimeStorage`
+Adds new partitions to an existing storage, replaying over stored data. Used to build OLS intermediate partitions (`ou_delta_rd`, `ou_d_mean`) and the regression stats partition on top of replayed demand data.
+
+### `analysis.NewScalarRegressionStatsPartition`
+Builds a streaming scalar OLS regression partition. State layout (no-intercept, cumulative): `[Sxx, Sxy, Syy, n, beta, sigma2]`. Used in `cmd/infer` Step 2.
+
+```go
+olsPartition := analysis.NewScalarRegressionStatsPartition(
+    analysis.AppliedScalarRegressionStats{
+        Name:      "ou_ols",
+        Y:         analysis.DataRef{PartitionName: "ou_delta_rd"},
+        X:         analysis.DataRef{PartitionName: "ou_d_mean"},
+        Intercept: false,
+        Mode:      analysis.RegressionStatsCumulative,
+    }, storage)
+// beta = finalOLS[4], sigma2 = finalOLS[5]
+// theta = -log(1-beta) / dt
+// sigma = sqrt(2*theta*sigma2 / (1 - exp(-2*theta*dt)))
+```
+
+### `analysis.RunSMCInference`
+Batch sequential Monte Carlo. N particles, each evaluated via an embedded `SMCInnerSimConfig`. Used in `cmd/infer` Step 3. Priors are in log-space (log θ, log σ); results are exponentiated via delta method.
+
+```go
+result := analysis.RunSMCInference(analysis.AppliedSMCInference{
+    NumParticles: N, NumRounds: rounds,
+    ParamNames:   []string{"log_theta", "log_sigma"},
+    Priors:       []inference.Prior{...TruncatedNormalPrior...},
+    Model: analysis.SMCParticleModel{
+        Build: func(nParticles, nParams int) *analysis.SMCInnerSimConfig {
+            return buildOUInnerSim(nParticles, rdData, lagData, muData, T)
+        },
+    },
+})
+smcTheta := math.Exp(result.PosteriorMean[0])
+smcSigma := math.Exp(result.PosteriorMean[1])
+```
+
+The inner sim (`buildOUInnerSim`) uses `general.FromStorageIteration{Data: ...}` to embed pre-computed data, `general.ParamValuesIteration` for per-particle param passthrough, and `inference.DataComparisonIteration{Likelihood: &grid.OUTransitionLikelihood{}}` for per-particle log-likelihood accumulation.
+
+## Command Reference
+
+| Command | Usage | Description |
+|---------|-------|-------------|
+| `cmd/ingest` | `go run ./cmd/ingest` | Downloads NESO demand CSV to `dat/demand.csv` |
+| `cmd/simulate` | `go run ./cmd/simulate -thetas 0.24 -sigmas 1591` | Runs stochastic grid simulation |
+| `cmd/infer` | `go run ./cmd/infer -data dat/demand.csv [-smc -particles 200 -rounds 20]` | Infers OU parameters; OLS always, SMC optional |
+| `cmd/evaluate` | `go run ./cmd/evaluate` | Evaluates battery dispatch policy outcomes |
+
+## Key Architectural Notes
+
+- **`ParamsFromUpstream` vs `stateHistories`**: `ParamsFromUpstream` reflects the **current step's** upstream output. `stateHistories[i].Values.At(0, 0)` is **one step behind** (updated after all Iterate calls). Use `ParamsFromUpstream` when you need same-step values (e.g., `ScalarDifferenceIteration`); use `LaggedValuesIteration` (via `ParamsAsPartitions`) to get the previous step's value intentionally.
+- **OUTransitionLikelihood log-parameterisation**: "thetas" and "sigmas" params are log(θ) and log(σ). This ensures θ,σ > 0 always and keeps SMC covariance regularisation numerically stable.
+- **SMC inner sim data embedding**: Use `general.FromStorageIteration{Data: storage.GetValues("partition_name")}` to replay historical series inside the SMC inner simulation. The inner sim runs T−1 steps with `ConstantTimestepFunction{Stepsize: 0.5}` matching the original data cadence.

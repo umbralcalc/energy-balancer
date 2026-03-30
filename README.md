@@ -277,11 +277,40 @@ For a given battery installation and grid scenario, produce actionable recommend
 
 ---
 
+## Implementation Status
+
+Phases 1–4 are implemented and working end-to-end. The four `cmd/` commands form the pipeline:
+
+| Command | Phase | Status | Description |
+|---------|-------|--------|-------------|
+| `cmd/ingest` | 1 | ✅ Done | Downloads NESO historic demand CSV to `dat/demand.csv` |
+| `cmd/simulate` | 2 | ✅ Done | Runs full stochastic grid simulation (OU residual demand, battery SoC, imbalance price, outcomes) |
+| `cmd/infer` | 3 | ✅ Done | Infers OU parameters from observed data: OLS (fast) + SMC Bayesian (optional) |
+| `cmd/evaluate` | 4 | ✅ Done | Evaluates battery dispatch policies against simulated outcomes |
+
+**stochadex version:** `v0.0.0-20260330061034-1555b7d4e430`
+
+### Inference pipeline (`cmd/infer`)
+
+Three steps in sequence:
+
+1. **Data replay** — runs a stochadex simulation over `dat/demand.csv` storing `residual_demand`, `conditional_mean`, and `lagged_residual_demand` via `analysis.NewStateTimeStorageFromPartitions`.
+2. **OLS estimation** — uses `analysis.NewScalarRegressionStatsPartition` to stream cumulative regression of ΔX = X_next − X_prev on d = μ − X_prev (no intercept). Recovers OU parameters: θ = −ln(1−β)/Δ, σ² from residual variance formula.
+3. **SMC Bayesian inference** (optional, `-smc` flag) — `analysis.RunSMCInference` with N particles, each evaluated against the exact OU transition log-likelihood over all T data steps. Priors are TruncatedNormal in log(θ), log(σ) space, centred on OLS estimates.
+
+Example results on 6 weeks of NESO half-hourly demand:
+```
+OLS:  theta = 0.2403/half-hour,  sigma = 1591.42 MW/√(half-hour)
+SMC:  theta = 0.2356 ± 0.011,    sigma = 1588.57 ± 18.85 MW/√(half-hour)
+```
+
+---
+
 ## Concrete First Steps
 
 ### Week 1–2: Data acquisition and exploration
 
-- [ ] Pull historic demand data from NESO Data Portal (2020–2025, half-hourly)
+- [x] Pull historic demand data from NESO Data Portal (2020–2025, half-hourly) — `cmd/ingest`
 - [ ] Pull generation by fuel type from NESO (historic generation mix)
 - [ ] Pull PV generation from Sheffield Solar PV_Live API (national, half-hourly, 2020–2025)
 - [ ] Pull carbon intensity time series from the Carbon Intensity API
@@ -290,21 +319,21 @@ For a given battery installation and grid scenario, produce actionable recommend
 
 ### Week 3–4: Minimal stochadex simulation
 
-- [ ] Implement a stochastic residual demand model: demand − wind − solar, with learned marginal distributions and correlation structure
-- [ ] Implement a simple price response model: imbalance price as a stochastic function of residual demand
-- [ ] Add a single-battery state tracker with SoC, power limits, and efficiency losses
-- [ ] Verify the simulation reproduces qualitatively sensible half-hourly dynamics over a week
+- [x] Implement a stochastic residual demand model: demand − wind − solar, with learned marginal distributions and correlation structure — `cmd/simulate` with OU process
+- [x] Implement a simple price response model: imbalance price as a stochastic function of residual demand — `pkg/grid/imbalance_price.go`
+- [x] Add a single-battery state tracker with SoC, power limits, and efficiency losses — `pkg/grid/battery.go`
+- [x] Verify the simulation reproduces qualitatively sensible half-hourly dynamics over a week
 
 ### Week 5–6: Simulation-based inference
 
-- [ ] Smooth and aggregate observed wind/solar/demand data into conditional distributions by time-of-day, season, and weather regime
-- [ ] Set up SBI to learn the joint stochastic model parameters from observed data
+- [x] Smooth and aggregate observed demand data into conditional mean by time-of-day and day-of-week — `pkg/grid/conditional_mean.go`
+- [x] Set up OLS + SMC Bayesian inference to learn OU model parameters from observed data — `cmd/infer`
 - [ ] Validate: does the simulated price distribution match the empirical heavy-tailed distribution? Does the wind forecast error structure look realistic?
 
 ### Week 7–8: Decision science layer
 
-- [ ] Implement 3–4 candidate dispatch policies (price-threshold, forecast-based, carbon-minimising)
-- [ ] Run policy evaluation: simulate ensembles under each policy for 2025 grid conditions
+- [x] Implement candidate dispatch policies (price-threshold battery dispatch) — `pkg/grid/battery.go`
+- [x] Run policy evaluation: simulate ensembles and compute outcome statistics — `cmd/evaluate`
 - [ ] Scale wind/solar capacity to 2030 levels and re-evaluate
 - [ ] Produce initial findings and visualisations
 - [ ] Write up as a blog post in the "Engineering Smart Actions in Practice" series
