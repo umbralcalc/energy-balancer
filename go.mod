@@ -3,7 +3,7 @@ module github.com/umbralcalc/energy-balancer
 go 1.25.2
 
 require (
-	github.com/umbralcalc/stochadex v0.0.0-20260329101819-139d2f8ca54e
+	github.com/umbralcalc/stochadex v0.0.0-20260330061034-1555b7d4e430
 	gonum.org/v1/gonum v0.16.0
 )
 

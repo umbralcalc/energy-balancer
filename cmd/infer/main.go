@@ -10,24 +10,21 @@ import (
 	"github.com/umbralcalc/stochadex/pkg/analysis"
 	"github.com/umbralcalc/stochadex/pkg/general"
 	"github.com/umbralcalc/stochadex/pkg/inference"
-	"github.com/umbralcalc/stochadex/pkg/kernels"
 	"github.com/umbralcalc/stochadex/pkg/simulator"
 )
 
 func main() {
 	dataPath := flag.String("data", "dat/demand.csv", "Path to NESO demand CSV")
-	steps := flag.Int("steps", 2016, "Number of steps to infer over (default: ~6 weeks)")
-	ouTheta := flag.Float64("theta", 0.2, "Initial OU theta guess (per half-hour); near OLS ~0.17 on typical demand")
-	ouSigma := flag.Float64("sigma", 1500.0, "Initial OU sigma guess (MW per sqrt-half-hour)")
-	windowDepth := flag.Int("window", 100, "Rolling window depth for mean/variance estimation")
-	pastDiscount := flag.Float64("discount", 1.0, "Past discounting factor for posterior (1.0 = full memory)")
-	runSBI := flag.Bool("sbi", false, "Run stochadex analysis posterior + rolling stats (slow); default is OLS/MLE only")
-	showAnalysisPosterior := flag.Bool("show-analysis-posterior", false, "With -sbi, print online posterior mean (often unstable; OLS is recommended)")
+	steps := flag.Int("steps", 2016, "Number of steps to infer over (default: ~6 weeks of half-hours)")
+	runSMC := flag.Bool("smc", false, "Run SMC Bayesian inference in addition to OLS")
+	numParticles := flag.Int("particles", 200, "Number of SMC particles")
+	numRounds := flag.Int("rounds", 20, "Number of SMC rounds")
 	flag.Parse()
 
-	// Step 1: Replay observed demand data to populate storage.
-	// Also computes lagged_residual_demand = residual_demand[t-1], used in
-	// the OU transition likelihood as the previous state.
+	// -------------------------------------------------------------------------
+	// Step 1: Replay observed demand data.
+	// Produces: residual_demand, conditional_mean, lagged_residual_demand.
+	// -------------------------------------------------------------------------
 	log.Println("Step 1: Replaying observed demand data...")
 	storage := analysis.NewStateTimeStorageFromPartitions(
 		[]*simulator.PartitionConfig{
@@ -76,204 +73,281 @@ func main() {
 	)
 	log.Printf("  %d steps stored", len(storage.GetTimes()))
 
-	demandStorage := storage
-	dt := 0.5
-	olsTheta, olsSigma := grid.ODEMLEFromStateTimeStorage(
-		demandStorage,
-		"residual_demand",
-		"lagged_residual_demand",
-		"conditional_mean",
-		dt,
-	)
+	// -------------------------------------------------------------------------
+	// Step 2: OLS via streaming scalar regression.
+	//
+	// Regresses ΔX = X_next - X_prev (ou_delta_rd) on d = mu - X_prev (ou_d_mean)
+	// with no intercept. The Gaussian AR(1) form gives:
+	//   E[ΔX | X_prev] = (1 - exp(-θΔ)) · d
+	//   β = Cov(ΔX, d) / Var(d) ≈ 1 - exp(-θΔ)
+	//   θ = -ln(1-β) / Δ
+	//   σ = sqrt(2θ · Var(residual) / (1 - exp(-2θΔ)))
+	//
+	// Uses analysis.NewScalarRegressionStatsPartition for the streaming summation.
+	// -------------------------------------------------------------------------
+	log.Println("Step 2: OLS estimation of OU parameters...")
 
-	if !*runSBI {
-		fmt.Println()
-		if math.IsNaN(olsTheta) || math.IsNaN(olsSigma) {
-			log.Println("Warning: OLS/MLE fit failed (insufficient or invalid data).")
-		} else {
-			fmt.Println("MLE/OLS on observed demand (recommended for cmd/simulate):")
-			fmt.Printf("  theta (mean-reversion speed, per half-hour): %.4f\n", olsTheta)
-			fmt.Printf("  sigma (volatility, MW/sqrt(half-hour)):      %.2f\n", olsSigma)
-		}
-		fmt.Println()
-		if !math.IsNaN(olsTheta) && !math.IsNaN(olsSigma) {
-			fmt.Println("Update cmd/simulate price_noise with:")
-			fmt.Printf("  thetas: [%.4f]  sigmas: [%.2f]\n", olsTheta, olsSigma)
-		}
-		log.Println("Done. (Pass -sbi to run analysis-package posterior estimation.)")
-		return
+	// Intermediate difference partitions (wired via ParamsFromUpstream so they
+	// see the current step's upstream outputs, not the one-step-lagged history).
+	deltaRdPartition := &simulator.PartitionConfig{
+		Name:            "ou_delta_rd",
+		Iteration:       &grid.ScalarDifferenceIteration{},
+		Params:          simulator.NewParams(make(map[string][]float64)),
+		ParamsFromUpstream: map[string]simulator.NamedUpstreamConfig{
+			"a": {Upstream: "residual_demand"},
+			"b": {Upstream: "lagged_residual_demand"},
+		},
+		InitStateValues:   []float64{0},
+		StateHistoryDepth: 1,
+		Seed:              0,
 	}
-
-	// Step 2: Compute rolling mean and variance of observed residual demand.
-	log.Println("Step 2: Computing rolling mean and variance of residual demand...")
-	meanPartition := analysis.NewVectorMeanPartition(
-		analysis.AppliedAggregation{
-			Name:   "residual_demand_mean",
-			Data:   analysis.DataRef{PartitionName: "residual_demand"},
-			Kernel: &kernels.ExponentialIntegrationKernel{},
+	dMeanPartition := &simulator.PartitionConfig{
+		Name:            "ou_d_mean",
+		Iteration:       &grid.ScalarDifferenceIteration{},
+		Params:          simulator.NewParams(make(map[string][]float64)),
+		ParamsFromUpstream: map[string]simulator.NamedUpstreamConfig{
+			"a": {Upstream: "conditional_mean"},
+			"b": {Upstream: "lagged_residual_demand"},
 		},
-		storage,
-	)
-	meanPartition.Params.Set(
-		"exponential_weighting_timescale", []float64{float64(*windowDepth)})
-	storage = analysis.AddPartitionsToStateTimeStorage(
-		storage,
-		[]*simulator.PartitionConfig{meanPartition},
-		map[string]int{"residual_demand": *windowDepth},
-	)
-
-	varPartition := analysis.NewVectorVariancePartition(
-		analysis.DataRef{PartitionName: "residual_demand_mean"},
-		analysis.AppliedAggregation{
-			Name:         "residual_demand_var",
-			Data:         analysis.DataRef{PartitionName: "residual_demand"},
-			Kernel:       &kernels.ExponentialIntegrationKernel{},
-			DefaultValue: 1e6,
-		},
-		storage,
-	)
-	varPartition.Params.Set(
-		"exponential_weighting_timescale", []float64{float64(*windowDepth)})
-	storage = analysis.AddPartitionsToStateTimeStorage(
-		storage,
-		[]*simulator.PartitionConfig{varPartition},
-		map[string]int{
-			"residual_demand":      *windowDepth,
-			"residual_demand_mean": 1,
-		},
-	)
-	log.Println("  Rolling statistics computed")
-
-	// Step 3: Posterior estimation (analysis.NewPosteriorEstimationPartitions).
-	// Latent state is [log(theta), log(sigma)]; OUTransitionLikelihood exp()s them.
-	// The sampler uses inference.NormalLikelihoodDistribution with fixed diagonal
-	// variance (independent marginals). Mean comes from ou_posterior_mean; we do
-	// not wire covariance_matrix from ou_posterior_cov (dense MVN + streamed matrix
-	// previously produced perfectly correlated proposals mid-run).
-	log.Println("Step 3: Inferring OU parameters via posterior estimation...")
-
-	logTheta := math.Log(*ouTheta)
-	logSigma := math.Log(*ouSigma)
-
-	// Passthrough: inner window reads [log(theta), log(sigma)] from the sampler.
-	ouParamsPassthrough := &simulator.PartitionConfig{
-		Name:              "ou_params_passthrough",
-		Iteration:         &general.ParamValuesIteration{},
-		Params:            simulator.NewParams(map[string][]float64{"param_values": {logTheta, logSigma}}),
-		InitStateValues:   []float64{logTheta, logSigma},
+		InitStateValues:   []float64{0},
 		StateHistoryDepth: 1,
 		Seed:              0,
 	}
 
-	// Prior / initial covariance for ou_posterior_cov (online estimate; not used by sampler).
-	priorCov := []float64{0.25, 0.0, 0.0, 1.0}
-
-	posteriorPartitions := analysis.NewPosteriorEstimationPartitions(
-		analysis.AppliedPosteriorEstimation{
-			LogNorm: analysis.PosteriorLogNorm{
-				Name:    "ou_log_norm",
-				Default: 0.0,
-			},
-			Mean: analysis.PosteriorMean{
-				Name:    "ou_posterior_mean",
-				Default: []float64{logTheta, logSigma},
-			},
-			Covariance: analysis.PosteriorCovariance{
-				Name:    "ou_posterior_cov",
-				Default: priorCov,
-			},
-			Sampler: analysis.PosteriorSampler{
-				Name:    "ou_params_sampler",
-				Default: []float64{logTheta, logSigma},
-				Distribution: analysis.ParameterisedModel{
-					Likelihood: &inference.NormalLikelihoodDistribution{},
-					Params: simulator.NewParams(map[string][]float64{
-						// Diagonal proposal: match former OUParamsProposal stds 0.5, 1.0.
-						"variance": {0.25, 1.0},
-					}),
-					ParamsFromUpstream: map[string]simulator.NamedUpstreamConfig{
-						"mean": {Upstream: "ou_posterior_mean"},
-					},
-				},
-			},
-			Comparison: analysis.AppliedLikelihoodComparison{
-				Name: "ou_loglikelihood",
-				// Exact OU transition density. Inside the window, residual_demand and
-				// lagged_residual_demand replay historical X(t) and X(t-1);
-				// conditional_mean replays historical mu(t). The sampler's
-				// [theta, sigma] are forwarded via ou_params_passthrough.
-				Model: analysis.ParameterisedModel{
-					Likelihood: &grid.OUTransitionLikelihood{},
-					Params:     simulator.NewParams(make(map[string][]float64)),
-					ParamsFromUpstream: map[string]simulator.NamedUpstreamConfig{
-						"previous_state": {Upstream: "lagged_residual_demand"},
-						"mus":            {Upstream: "conditional_mean"},
-						"thetas":         {Upstream: "ou_params_passthrough", Indices: []int{0}}, // log(theta)
-						"sigmas":         {Upstream: "ou_params_passthrough", Indices: []int{1}}, // log(sigma)
-					},
-				},
-				Data: analysis.DataRef{PartitionName: "residual_demand"},
-				Window: analysis.WindowedPartitions{
-					Partitions: []analysis.WindowedPartition{{
-						Partition: ouParamsPassthrough,
-						OutsideUpstreams: map[string]simulator.NamedUpstreamConfig{
-							"param_values": {Upstream: "ou_params_sampler"},
-						},
-					}},
-					Data: []analysis.DataRef{
-						{PartitionName: "residual_demand"},
-						{PartitionName: "lagged_residual_demand"},
-						{PartitionName: "conditional_mean"},
-					},
-					Depth: *windowDepth,
-				},
-			},
-			PastDiscount: *pastDiscount,
-			MemoryDepth:  *windowDepth,
-			Seed:         1234,
-		},
-		storage,
-	)
-
+	// Add difference partitions first so the OLS partition can reference them.
 	storage = analysis.AddPartitionsToStateTimeStorage(
 		storage,
-		posteriorPartitions,
-		map[string]int{
-			"residual_demand":        *windowDepth,
-			"lagged_residual_demand": *windowDepth,
-			"conditional_mean":       *windowDepth,
-			"residual_demand_mean":   *windowDepth,
-			"residual_demand_var":    *windowDepth,
+		[]*simulator.PartitionConfig{deltaRdPartition, dMeanPartition},
+		nil,
+	)
+
+	olsPartition := analysis.NewScalarRegressionStatsPartition(
+		analysis.AppliedScalarRegressionStats{
+			Name:              "ou_ols",
+			Y:                 analysis.DataRef{PartitionName: "ou_delta_rd"},
+			X:                 analysis.DataRef{PartitionName: "ou_d_mean"},
+			Intercept:         false,
+			Mode:              analysis.RegressionStatsCumulative,
+			StateHistoryDepth: 1,
+		},
+		storage,
+	)
+	storage = analysis.AddPartitionsToStateTimeStorage(
+		storage,
+		[]*simulator.PartitionConfig{olsPartition},
+		nil,
+	)
+
+	// Extract OLS estimates from the final state.
+	// State layout (no intercept, cumulative): [Sxx, Sxy, Syy, n, beta, sigma2]
+	dt := 0.5
+	olsState := storage.GetValues("ou_ols")
+	finalOLS := olsState[len(olsState)-1]
+	beta := finalOLS[4]
+	sigma2 := finalOLS[5]
+
+	var olsTheta, olsSigma float64
+	olsOK := beta > 1e-9 && beta < 1.0-1e-12 && sigma2 >= 0
+	if olsOK {
+		olsTheta = -math.Log(1-beta) / dt
+		den := 1.0 - math.Exp(-2*olsTheta*dt)
+		if den > 0 {
+			olsSigma = math.Sqrt(2 * olsTheta * sigma2 / den)
+		} else {
+			olsOK = false
+		}
+	}
+
+	if !olsOK || math.IsNaN(olsTheta) || math.IsNaN(olsSigma) {
+		log.Println("Warning: OLS fit failed (insufficient or degenerate data).")
+	} else {
+		fmt.Println()
+		fmt.Println("OLS/MLE estimates (recommended for cmd/simulate):")
+		fmt.Printf("  theta (mean-reversion speed, /half-hour): %.4f\n", olsTheta)
+		fmt.Printf("  sigma (volatility, MW/sqrt(half-hour)):   %.2f\n", olsSigma)
+		fmt.Printf("  → thetas: [%.4f]  sigmas: [%.2f]\n", olsTheta, olsSigma)
+	}
+
+	if !*runSMC {
+		log.Println("Done. (Pass -smc to run SMC Bayesian inference.)")
+		return
+	}
+
+	// -------------------------------------------------------------------------
+	// Step 3: SMC Bayesian inference of log(theta) and log(sigma).
+	//
+	// Builds N particles each evaluated against the exact OU transition
+	// log-likelihood over all T steps of replayed demand data.
+	// The OUTransitionLikelihood interprets "thetas" as log(theta) and
+	// "sigmas" as log(sigma), so both params are on a similar scale and the
+	// SMC covariance regularisation works well.
+	// -------------------------------------------------------------------------
+	log.Printf("Step 3: SMC Bayesian inference (%d particles, %d rounds)...",
+		*numParticles, *numRounds)
+
+	// Centre priors on OLS estimates if available; fall back to wide defaults.
+	priorLogTheta := math.Log(0.2)
+	priorLogSigma := math.Log(1500.0)
+	if olsOK && olsTheta > 0 && olsSigma > 0 {
+		priorLogTheta = math.Log(olsTheta)
+		priorLogSigma = math.Log(olsSigma)
+	}
+
+	// Load the replayed series for embedding in the inner SMC simulation.
+	rdData := storage.GetValues("residual_demand")
+	lagData := storage.GetValues("lagged_residual_demand")
+	muData := storage.GetValues("conditional_mean")
+	T := len(rdData)
+
+	N := *numParticles
+	result := analysis.RunSMCInference(analysis.AppliedSMCInference{
+		ProposalName:  "ou_proposal",
+		SimName:       "ou_sim",
+		PosteriorName: "ou_posterior",
+		NumParticles:  N,
+		NumRounds:     *numRounds,
+		ParamNames:    []string{"log_theta", "log_sigma"},
+		Priors: []inference.Prior{
+			// log(theta): truncated normal centred on OLS, ±2 log-units wide
+			&inference.TruncatedNormalPrior{
+				Mu:    priorLogTheta,
+				Sigma: 1.5,
+				Lo:    math.Log(1e-4),
+				Hi:    math.Log(20.0),
+			},
+			// log(sigma): truncated normal centred on OLS, ±2 log-units wide
+			&inference.TruncatedNormalPrior{
+				Mu:    priorLogSigma,
+				Sigma: 1.5,
+				Lo:    math.Log(10.0),
+				Hi:    math.Log(1e5),
+			},
+		},
+		Seed:    42,
+		Verbose: true,
+		Model: analysis.SMCParticleModel{
+			Build: func(nParticles, nParams int) *analysis.SMCInnerSimConfig {
+				return buildOUInnerSim(nParticles, rdData, lagData, muData, T)
+			},
+		},
+	})
+
+	if result == nil {
+		log.Println("SMC inference returned no result.")
+		return
+	}
+
+	smcTheta := math.Exp(result.PosteriorMean[0])
+	smcSigma := math.Exp(result.PosteriorMean[1])
+	smcThetaStd := smcTheta * result.PosteriorStd[0] // delta method
+	smcSigmaStd := smcSigma * result.PosteriorStd[1]
+
+	fmt.Println()
+	fmt.Println("SMC Bayesian posterior estimates:")
+	fmt.Printf("  theta: %.4f ± %.4f /half-hour\n", smcTheta, smcThetaStd)
+	fmt.Printf("  sigma: %.2f ± %.2f MW/sqrt(half-hour)\n", smcSigma, smcSigmaStd)
+	fmt.Printf("  log marginal likelihood: %.2f\n", result.LogMarginalLik)
+	fmt.Printf("  → thetas: [%.4f]  sigmas: [%.2f]\n", smcTheta, smcSigma)
+
+	log.Println("Done.")
+}
+
+// buildOUInnerSim constructs the SMC inner simulation that evaluates N particles
+// against the exact OU transition log-likelihood over T-1 data steps.
+//
+// Each particle p has params [log_theta_p, log_sigma_p] forwarded from the
+// proposal partition (flat index p*2, p*2+1).
+func buildOUInnerSim(
+	N int,
+	rdData, lagData, muData [][]float64,
+	T int,
+) *analysis.SMCInnerSimConfig {
+	partitions := make([]*simulator.PartitionConfig, 0, 3+2*N)
+	loglikePartitions := make([]string, N)
+	paramForwarding := make(map[string][]int, N)
+
+	// Shared data replay partitions.
+	partitions = append(partitions,
+		&simulator.PartitionConfig{
+			Name:              "residual_demand",
+			Iteration:         &general.FromStorageIteration{Data: rdData},
+			Params:            simulator.NewParams(make(map[string][]float64)),
+			InitStateValues:   rdData[0],
+			StateHistoryDepth: 1,
+			Seed:              0,
+		},
+		&simulator.PartitionConfig{
+			Name:      "lagged_residual_demand",
+			Iteration: &grid.LaggedValuesIteration{},
+			Params:    simulator.NewParams(make(map[string][]float64)),
+			ParamsAsPartitions: map[string][]string{
+				"source_partition": {"residual_demand"},
+			},
+			InitStateValues:   lagData[0],
+			StateHistoryDepth: 1,
+			Seed:              0,
+		},
+		&simulator.PartitionConfig{
+			Name:              "conditional_mean",
+			Iteration:         &general.FromStorageIteration{Data: muData},
+			Params:            simulator.NewParams(make(map[string][]float64)),
+			InitStateValues:   muData[0],
+			StateHistoryDepth: 1,
+			Seed:              0,
 		},
 	)
 
-	posteriorMeanValues := storage.GetValues("ou_posterior_mean")
-	finalParams := posteriorMeanValues[len(posteriorMeanValues)-1]
-	thetaHat := math.Exp(finalParams[0])
-	sigmaHat := math.Exp(finalParams[1])
+	// Per-particle params passthrough and loglike accumulator.
+	for p := range N {
+		paramsName := fmt.Sprintf("ou_params_%d", p)
+		loglikeName := fmt.Sprintf("ou_loglike_%d", p)
 
-	fmt.Println()
-	if math.IsNaN(olsTheta) || math.IsNaN(olsSigma) {
-		log.Println("Warning: OLS/MLE fit failed (insufficient or invalid data).")
-	} else {
-		fmt.Println("MLE/OLS on observed demand (recommended for cmd/simulate):")
-		fmt.Printf("  theta (mean-reversion speed, per half-hour): %.4f\n", olsTheta)
-		fmt.Printf("  sigma (volatility, MW/sqrt(half-hour)):      %.2f\n", olsSigma)
-	}
-	fmt.Println()
-	if *showAnalysisPosterior {
-		fmt.Println("Online posterior mean (stochadex analysis — diagnostic only):")
-		fmt.Printf("  theta: %.4f\n", thetaHat)
-		fmt.Printf("  sigma: %.2f\n", sigmaHat)
-		fmt.Println()
-	}
-	if !math.IsNaN(olsTheta) && !math.IsNaN(olsSigma) {
-		fmt.Println("Update cmd/simulate price_noise with the MLE/OLS row:")
-		fmt.Printf("  thetas: [%.4f]  sigmas: [%.2f]\n", olsTheta, olsSigma)
-	} else {
-		fmt.Println("Update cmd/simulate using the diagnostic row if OLS failed.")
-		fmt.Printf("  thetas: [%.4f]  sigmas: [%.2f]\n", thetaHat, sigmaHat)
+		partitions = append(partitions, &simulator.PartitionConfig{
+			Name:            paramsName,
+			Iteration:       &general.ParamValuesIteration{},
+			Params:          simulator.NewParams(map[string][]float64{"param_values": {0, 0}}),
+			InitStateValues: []float64{0, 0},
+			StateHistoryDepth: 1,
+			Seed:            0,
+		})
+
+		partitions = append(partitions, &simulator.PartitionConfig{
+			Name: loglikeName,
+			Iteration: &inference.DataComparisonIteration{
+				Likelihood: &grid.OUTransitionLikelihood{},
+			},
+			Params: simulator.NewParams(map[string][]float64{
+				"cumulative":    {1},
+				"burn_in_steps": {0},
+			}),
+			ParamsFromUpstream: map[string]simulator.NamedUpstreamConfig{
+				"latest_data_values": {Upstream: "residual_demand"},
+				"previous_state":     {Upstream: "lagged_residual_demand"},
+				"mus":                {Upstream: "conditional_mean"},
+				"thetas":             {Upstream: paramsName, Indices: []int{0}},
+				"sigmas":             {Upstream: paramsName, Indices: []int{1}},
+			},
+			InitStateValues:   []float64{0.0},
+			StateHistoryDepth: 1,
+			Seed:              0,
+		})
+
+		loglikePartitions[p] = loglikeName
+		paramForwarding[paramsName+"/param_values"] = []int{p * 2, p*2 + 1}
 	}
 
-	log.Println("Done.")
+	return &analysis.SMCInnerSimConfig{
+		Partitions: partitions,
+		Simulation: &simulator.SimulationConfig{
+			OutputCondition: &simulator.NilOutputCondition{},
+			OutputFunction:  &simulator.NilOutputFunction{},
+			TerminationCondition: &simulator.NumberOfStepsTerminationCondition{
+				MaxNumberOfSteps: T - 1,
+			},
+			TimestepFunction: &simulator.ConstantTimestepFunction{Stepsize: 0.5},
+			InitTimeValue:    0.0,
+		},
+		LoglikePartitions: loglikePartitions,
+		ParamForwarding:   paramForwarding,
+	}
 }
