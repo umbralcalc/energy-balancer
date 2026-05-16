@@ -1,0 +1,286 @@
+<div id="dexetera-energy" class="dexetera-widget">
+<style>
+#dexetera-energy { font-family: system-ui, -apple-system, sans-serif; color: #2c3e50; line-height: 1.5; }
+#dexetera-energy .description { margin: 0 0 1em; color: #2c3e50; opacity: 0.85; font-size: 1rem; }
+#dexetera-energy code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.95em; background: rgba(60,120,216,0.08); padding: 0.05em 0.3em; border-radius: 3px; }
+#dexetera-energy .dashboard { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 0.9em; }
+#dexetera-energy .panel { border: 1px solid #2c3e50; border-radius: 6px; padding: 0.8em 0.9em; background: #ffffff; display: flex; flex-direction: column; gap: 0.6em; box-sizing: border-box; }
+#dexetera-energy .panel-title { font-weight: 600; color: #2c3e50; font-size: 1rem; }
+#dexetera-energy canvas { display: block; width: 100%; max-width: 640px; height: auto; aspect-ratio: 640 / 400; margin: 0 auto; background: #ffffff; }
+#dexetera-energy .panel-readout { margin: 0; font-size: 1rem; color: #2c3e50; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+#dexetera-energy .slider { display: grid; grid-template-columns: 1fr 80px; grid-template-areas: "name readout" "input input"; align-items: center; gap: 0.3em 1em; font-size: 1rem; }
+#dexetera-energy .slider-name { grid-area: name; color: #2c3e50; }
+#dexetera-energy .slider input[type="range"] { grid-area: input; width: 100%; accent-color: #b0447a; }
+#dexetera-energy .slider-readout { grid-area: readout; text-align: right; color: #b0447a; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+#dexetera-energy .panel-actions { display: flex; flex-wrap: wrap; gap: 0.6em; margin-top: 0.4em; }
+#dexetera-energy button.button-secondary { cursor: pointer; border: 1px solid #2c3e50; background: #ffffff; color: #2c3e50; padding: 0.4em 0.85em; border-radius: 6px; font-size: 1rem; font-family: inherit; }
+#dexetera-energy button.button-secondary:hover { background: #f4f6f9; }
+#dexetera-energy .status { margin: 1em 0 0; text-align: right; font-size: 0.9em; color: #2c3e50; opacity: 0.6; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+#dexetera-energy .energy-selector { display: flex; flex-direction: column; gap: 0.4em; font-size: 1rem; margin-bottom: 0.6em; }#dexetera-energy .energy-selector-label { color: #2c3e50; font-weight: 600; }#dexetera-energy .energy-options { display: flex; flex-direction: column; gap: 0.3em; }#dexetera-energy .energy-options label { display: flex; align-items: center; gap: 0.4em; color: #2c3e50; cursor: pointer; }#dexetera-energy .energy-options input[type="radio"] { accent-color: #b0447a; }#dexetera-energy .policy-conditional { display: none; }#dexetera-energy .policy-conditional.is-active { display: block; }#dexetera-energy .policy-conditional-title { color: #2c3e50; font-weight: 600; font-size: 0.95rem; margin: 0.3em 0 0.2em; }</style>
+<p class="description">Grid battery dispatch policy support: pick a dispatch strategy and grid scenario, tune the trigger thresholds; the simulator (fitted to NESO half-hourly demand data) shows the resulting battery operation, revenue, and carbon savings over a 14-day window. This is a research model fitted to open data, not a trading or operational tool.</p>
+<div class="dashboard">
+    <section class="panel">
+        <div class="panel-title">Simulation</div>
+        <canvas width="640" height="400"></canvas>
+        
+        <p class="panel-readout" data-readout="display_progress">&nbsp;</p>
+        
+        <p class="panel-readout" data-readout="outcomes">&nbsp;</p>
+        
+    </section>
+    
+    <section class="panel">
+        <div class="panel-title">Live controls</div>
+        
+        <div class="energy-selector"><span class="energy-selector-label">Dispatch policy</span><div class="energy-options"><label><input type="radio" name="energy-policy" value="0" checked>Price threshold (£ arbitrage)</label><label><input type="radio" name="energy-policy" value="1">Carbon threshold (gCO₂ signal)</label></div><input type="range" data-slider="policy" min="0" max="1" step="1" value="0" style="display:none"><span data-slider-readout="policy" style="display:none"></span></div>
+        
+        <div class="energy-selector"><span class="energy-selector-label">Grid scenario</span><div class="energy-options"><label><input type="radio" name="energy-scenario" value="0" checked>2025 grid (current renewables)</label><label><input type="radio" name="energy-scenario" value="1">2030 grid (Holistic Transition)</label></div><input type="range" data-slider="scenario" min="0" max="1" step="1" value="0" style="display:none"><span data-slider-readout="scenario" style="display:none"></span></div>
+        
+        <div class="policy-conditional" data-policy="0"><p class="policy-conditional-title">Price-threshold settings</p><label class="slider">
+            <span class="slider-name">Discharge threshold (£/MWh)</span>
+            <input type="range" data-slider="price_high"
+                   min="20" max="100" step="1" value="45">
+            <span class="slider-readout" data-slider-readout="price_high">&nbsp;</span>
+        </label>
+        
+        <label class="slider">
+            <span class="slider-name">Charge threshold (£/MWh)</span>
+            <input type="range" data-slider="price_low"
+                   min="0" max="60" step="1" value="25">
+            <span class="slider-readout" data-slider-readout="price_low">&nbsp;</span>
+        </label></div>
+        
+        <div class="policy-conditional" data-policy="1"><p class="policy-conditional-title">Carbon-threshold settings</p><label class="slider">
+            <span class="slider-name">Discharge threshold (gCO₂/kWh)</span>
+            <input type="range" data-slider="carbon_high"
+                   min="100" max="400" step="5" value="250">
+            <span class="slider-readout" data-slider-readout="carbon_high">&nbsp;</span>
+        </label>
+        
+        <label class="slider">
+            <span class="slider-name">Charge threshold (gCO₂/kWh)</span>
+            <input type="range" data-slider="carbon_low"
+                   min="0" max="250" step="5" value="100">
+            <span class="slider-readout" data-slider-readout="carbon_low">&nbsp;</span>
+        </label></div>
+        
+        
+        <div class="panel-actions">
+            <button type="button" class="button-secondary" data-reset>Reset simulation</button>
+        </div>
+        
+    </section>
+    
+</div>
+<p class="status" data-status>Loading…</p>
+</div>
+<script>
+(function () {
+    var widget = document.getElementById('dexetera-energy');
+    var RUNTIME_BASE = 'https://pub-afdb1348ec964ca5b530aa758c0bdc56.r2.dev/assets/dexetera/runtime/';
+    var WASM_URL = 'https://pub-afdb1348ec964ca5b530aa758c0bdc56.r2.dev/assets/dexetera/widgets/energy/main.wasm';
+    var gameConfig = {"visualization":{"backgroundColor":"#fafafa","canvasHeight":400,"canvasWidth":640,"renderers":[{"partitionName":"","properties":{"color":"#2c3e50","fontSize":22,"text":"Battery state of charge (%)","textAlign":"left","x":60,"y":30},"type":"text"},{"partitionName":"","properties":{"color":"#2c3e50","width":1,"x1":60,"x2":580,"y1":180,"y2":180},"type":"line"},{"partitionName":"","properties":{"color":"#2c3e50","width":1,"x1":60,"x2":60,"y1":50,"y2":180},"type":"line"},{"partitionName":"soc_display","properties":{"color":"#3c78d8","height":130,"lineWidth":2,"width":520,"x":60,"y":50},"type":"lineChart"},{"partitionName":"","properties":{"color":"#2c3e50","fontSize":22,"text":"Cumulative net value (£k)","textAlign":"left","x":60,"y":220},"type":"text"},{"partitionName":"","properties":{"color":"#2c3e50","width":1,"x1":60,"x2":580,"y1":370,"y2":370},"type":"line"},{"partitionName":"","properties":{"color":"#2c3e50","width":1,"x1":60,"x2":60,"y1":240,"y2":370},"type":"line"},{"partitionName":"outcomes","properties":{"color":"#3c78d8","height":130,"lineWidth":2,"width":520,"x":60,"y":240},"type":"lineChart"},{"partitionName":"","properties":{"color":"#e3e6ec","width":1,"x1":60,"x2":580,"y1":210,"y2":210},"type":"line"}],"updateIntervalMs":0},"sliders":[{"name":"policy","partition":"policy_action","valueIndex":0,"default":0,"decimals":3},{"name":"scenario","partition":"policy_action","valueIndex":1,"default":0,"decimals":3},{"name":"price_high","partition":"policy_action","valueIndex":2,"default":45,"decimals":3},{"name":"price_low","partition":"policy_action","valueIndex":3,"default":25,"decimals":3},{"name":"carbon_high","partition":"policy_action","valueIndex":4,"default":250,"decimals":3},{"name":"carbon_low","partition":"policy_action","valueIndex":5,"default":100,"decimals":3}],"readouts":[{"partition":"display_progress","template":"hour {v0} of 336 · SoC {v1}%","decimals":1},{"partition":"outcomes","template":"net £{v0}k · revenue £{v1}k · degradation £{v2}k · carbon {v3} tCO₂ · {v4} EFC · {v5} active","decimals":1}],"showReset":true,"driver":{"kind":"inline","options":{"intervalMs":15}}};
+
+    // Load the renderer script lazily, sharing one promise across every
+    // dexetera widget on the same page.
+    function ensureRenderer() {
+        if (self.dexetera && self.dexetera.createRenderer) return Promise.resolve();
+        if (self.__dexeteraLoading) return self.__dexeteraLoading;
+        self.__dexeteraLoading = new Promise(function (resolve, reject) {
+            var s = document.createElement('script');
+            s.src = RUNTIME_BASE + 'renderer.js';
+            s.onload = function () { resolve(); };
+            s.onerror = function () { reject(new Error('failed to load ' + s.src)); };
+            document.head.appendChild(s);
+        });
+        return self.__dexeteraLoading;
+    }
+
+    function $(sel) { return widget.querySelector(sel); }
+    function $$(sel) { return widget.querySelectorAll(sel); }
+
+    function setStatus(msg) {
+        var el = $('[data-status]');
+        if (el) el.textContent = msg;
+    }
+
+    var slidersByPartition = (function () {
+        var grouped = {};
+        for (var i = 0; i < gameConfig.sliders.length; i++) {
+            var s = gameConfig.sliders[i];
+            if (!grouped[s.partition]) grouped[s.partition] = [];
+            grouped[s.partition].push(s);
+        }
+        return grouped;
+    })();
+
+    var worker = null;
+
+    function publishActions() {
+        for (var i = 0; i < gameConfig.sliders.length; i++) {
+            var s = gameConfig.sliders[i];
+            var input = $('[data-slider="' + s.name + '"]');
+            var ro = $('[data-slider-readout="' + s.name + '"]');
+            if (input && ro) ro.textContent = parseFloat(input.value).toFixed(s.decimals);
+        }
+        if (!worker) return;
+        var partitions = {};
+        for (var partition in slidersByPartition) {
+            if (!Object.prototype.hasOwnProperty.call(slidersByPartition, partition)) continue;
+            var group = slidersByPartition[partition];
+            var maxIdx = -1;
+            for (var j = 0; j < group.length; j++) maxIdx = Math.max(maxIdx, group[j].valueIndex);
+            var values = new Array(maxIdx + 1);
+            for (var k = 0; k <= maxIdx; k++) values[k] = 0;
+            for (var l = 0; l < group.length; l++) {
+                var sl = group[l];
+                var inp = $('[data-slider="' + sl.name + '"]');
+                values[sl.valueIndex] = parseFloat(inp ? inp.value : sl.default);
+            }
+            partitions[partition] = values;
+        }
+        worker.postMessage({ action: 'setActions', partitions: partitions });
+    }
+
+    function applyReadout(template, decimals, partitionState) {
+        var s = template;
+        s = s.replace(/\{t\}/g, Math.floor(partitionState.timesteps));
+        s = s.replace(/\{v(\d*)\}/g, function (_, idx) {
+            var i = idx === '' ? 0 : parseInt(idx, 10);
+            var v = partitionState.state.values[i];
+            return (v === undefined) ? '' : v.toFixed(decimals);
+        });
+        return s;
+    }
+
+    function ensureWorkerUrl() {
+        if (self.__dexeteraWorkerUrl) return Promise.resolve(self.__dexeteraWorkerUrl);
+        if (self.__dexeteraWorkerLoading) return self.__dexeteraWorkerLoading;
+        var BASE_ABS = new URL(RUNTIME_BASE, document.baseURI).href;
+        self.__dexeteraWorkerLoading = fetch(BASE_ABS + 'worker.js')
+            .then(function (r) {
+                if (!r.ok) throw new Error('failed to fetch worker.js: ' + r.status);
+                return r.text();
+            })
+            .then(function (src) {
+                var shim = '(function(){var BASE=' + JSON.stringify(BASE_ABS) +
+                    ';var orig=self.importScripts;self.importScripts=function(){' +
+                    'var args=Array.prototype.map.call(arguments,function(u){' +
+                    'return new URL(u,BASE).href;});return orig.apply(self,args);};})();\n';
+                var blob = new Blob([shim, src], { type: 'application/javascript' });
+                self.__dexeteraWorkerUrl = URL.createObjectURL(blob);
+                return self.__dexeteraWorkerUrl;
+            });
+        return self.__dexeteraWorkerLoading;
+    }
+
+    function startWorker(renderer) {
+        if (worker) worker.terminate();
+        ensureWorkerUrl().then(function (workerUrl) {
+        worker = new Worker(workerUrl);
+        worker.onmessage = function (e) {
+            var msg = e.data;
+            if (msg.type === 'partitionState') {
+                renderer.update(msg.data);
+                renderer.render();
+                for (var i = 0; i < gameConfig.readouts.length; i++) {
+                    var r = gameConfig.readouts[i];
+                    if (r.partition !== msg.data.partitionName) continue;
+                    var el = $('[data-readout="' + r.partition + '"]');
+                    if (el) el.textContent = applyReadout(r.template, r.decimals, msg.data);
+                }
+                if (worker && msg.data.timesteps >= 672) { worker.terminate(); worker = null; setStatus('14-day simulation complete. Use Reset to rerun.'); }
+            } else if (msg.type === 'status') {
+                setStatus(msg.data);
+                if (msg.data === 'inline driver ready') publishActions();
+            } else if (msg.type === 'error') {
+                console.error('dexetera worker error:', msg.data);
+                setStatus('Error: ' + msg.data);
+            }
+        };
+        worker.onerror = function (err) {
+            console.error('dexetera worker error:', err);
+            setStatus('Worker error: ' + err.message);
+        };
+        worker.postMessage({
+            action: 'start',
+            wasmBinary: new URL(WASM_URL, document.baseURI).href,
+            driver: gameConfig.driver,
+        });
+        publishActions();
+        }).catch(function (err) {
+            console.error(err);
+            setStatus('Failed to load dexetera worker: ' + err.message);
+        });
+    }
+
+    ensureRenderer().then(function () {
+        var canvas = $('canvas');
+        var renderer = self.dexetera.createRenderer(canvas, gameConfig.visualization);
+
+        for (var i = 0; i < gameConfig.sliders.length; i++) {
+            var s = gameConfig.sliders[i];
+            var el = $('[data-slider="' + s.name + '"]');
+            if (el) el.addEventListener('input', publishActions);
+        }
+        if (gameConfig.showReset) {
+            var btn = $('[data-reset]');
+            if (btn) btn.addEventListener('click', function () { startWorker(renderer); });
+        }
+        publishActions();
+        startWorker(renderer);
+    }).catch(function (err) {
+        console.error(err);
+        setStatus('Failed to load dexetera runtime: ' + err.message);
+    });
+})();
+</script>
+
+<script>
+(function () {
+    var widget = document.getElementById('dexetera-energy');
+    if (!widget) return;
+    var resetBtn = widget.querySelector('[data-reset]');
+
+    function wireGroup(radioName, sliderName, onChange) {
+        var radios = widget.querySelectorAll('input[name="' + radioName + '"]');
+        var slider = widget.querySelector('[data-slider="' + sliderName + '"]');
+        function applyValue(value) {
+            if (slider) {
+                slider.value = String(value);
+                slider.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+            if (onChange) onChange(value);
+        }
+        for (var i = 0; i < radios.length; i++) {
+            radios[i].addEventListener('change', function (e) {
+                applyValue(parseInt(e.target.value, 10));
+                if (resetBtn) resetBtn.click();
+            });
+        }
+        var initial = 0;
+        for (var j = 0; j < radios.length; j++) {
+            if (radios[j].checked) { initial = parseInt(radios[j].value, 10); break; }
+        }
+        // Initial state — sync slider + apply onChange but do NOT click
+        // Reset (the dexetera IIFE handles the very first sim start;
+        // clicking Reset on init would race the renderer load).
+        applyValue(initial);
+    }
+
+    function applyPolicyConditionals(value) {
+        var conditionals = widget.querySelectorAll('.policy-conditional');
+        for (var i = 0; i < conditionals.length; i++) {
+            var c = conditionals[i];
+            if (c.getAttribute('data-policy') === String(value)) {
+                c.classList.add('is-active');
+            } else {
+                c.classList.remove('is-active');
+            }
+        }
+    }
+
+    wireGroup('energy-policy', 'policy', applyPolicyConditionals);
+    wireGroup('energy-scenario', 'scenario', null);
+})();
+</script>
