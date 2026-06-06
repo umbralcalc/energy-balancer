@@ -384,6 +384,8 @@ Several natural extensions are straightforward within the stochadex framework:
 | [Sheffield Solar PV_Live](https://api0.solar.sheffield.ac.uk/pvlive/) | National solar PV generation (MW), half-hourly from 2013 | Free API, CC BY 4.0 |
 | [Elexon BMRS](https://bmrs.elexon.co.uk) | Imbalance prices (B1770), balancing mechanism actions | Free with registration |
 
+NESO and Elexon data is published as open data under their respective open-data licences; Carbon Intensity API and Sheffield Solar PV_Live data are licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). The MIT licence above covers this repository's code, not the underlying data.
+
 ---
 
 ## Dependencies
