@@ -10,6 +10,7 @@ import (
 	"github.com/umbralcalc/stochadex/pkg/analysis"
 	"github.com/umbralcalc/stochadex/pkg/general"
 	"github.com/umbralcalc/stochadex/pkg/inference"
+	"github.com/umbralcalc/stochadex/pkg/macros"
 	"github.com/umbralcalc/stochadex/pkg/simulator"
 )
 
@@ -83,16 +84,16 @@ func main() {
 	//   θ = -ln(1-β) / Δ
 	//   σ = sqrt(2θ · Var(residual) / (1 - exp(-2θΔ)))
 	//
-	// Uses analysis.NewScalarRegressionStatsPartition for the streaming summation.
+	// Uses macros.NewScalarRegressionStatsPartition for the streaming summation.
 	// -------------------------------------------------------------------------
 	log.Println("Step 2: OLS estimation of OU parameters...")
 
 	// Intermediate difference partitions (wired via ParamsFromUpstream so they
 	// see the current step's upstream outputs, not the one-step-lagged history).
 	deltaRdPartition := &simulator.PartitionConfig{
-		Name:            "ou_delta_rd",
-		Iteration:       &grid.ScalarDifferenceIteration{},
-		Params:          simulator.NewParams(make(map[string][]float64)),
+		Name:      "ou_delta_rd",
+		Iteration: &grid.ScalarDifferenceIteration{},
+		Params:    simulator.NewParams(make(map[string][]float64)),
 		ParamsFromUpstream: map[string]simulator.NamedUpstreamConfig{
 			"a": {Upstream: "residual_demand"},
 			"b": {Upstream: "lagged_residual_demand"},
@@ -102,9 +103,9 @@ func main() {
 		Seed:              0,
 	}
 	dMeanPartition := &simulator.PartitionConfig{
-		Name:            "ou_d_mean",
-		Iteration:       &grid.ScalarDifferenceIteration{},
-		Params:          simulator.NewParams(make(map[string][]float64)),
+		Name:      "ou_d_mean",
+		Iteration: &grid.ScalarDifferenceIteration{},
+		Params:    simulator.NewParams(make(map[string][]float64)),
 		ParamsFromUpstream: map[string]simulator.NamedUpstreamConfig{
 			"a": {Upstream: "conditional_mean"},
 			"b": {Upstream: "lagged_residual_demand"},
@@ -121,13 +122,13 @@ func main() {
 		nil,
 	)
 
-	olsPartition := analysis.NewScalarRegressionStatsPartition(
-		analysis.AppliedScalarRegressionStats{
+	olsPartition := macros.NewScalarRegressionStatsPartition(
+		macros.AppliedScalarRegressionStats{
 			Name:              "ou_ols",
 			Y:                 analysis.DataRef{PartitionName: "ou_delta_rd"},
 			X:                 analysis.DataRef{PartitionName: "ou_d_mean"},
 			Intercept:         false,
-			Mode:              analysis.RegressionStatsCumulative,
+			Mode:              macros.RegressionStatsCumulative,
 			StateHistoryDepth: 1,
 		},
 		storage,
@@ -200,7 +201,7 @@ func main() {
 	T := len(rdData)
 
 	N := *numParticles
-	result := analysis.RunSMCInference(analysis.AppliedSMCInference{
+	result := macros.RunSMCInference(macros.AppliedSMCInference{
 		ProposalName:  "ou_proposal",
 		SimName:       "ou_sim",
 		PosteriorName: "ou_posterior",
@@ -225,8 +226,8 @@ func main() {
 		},
 		Seed:    42,
 		Verbose: true,
-		Model: analysis.SMCParticleModel{
-			Build: func(nParticles, nParams int) *analysis.SMCInnerSimConfig {
+		Model: macros.SMCParticleModel{
+			Build: func(nParticles, nParams int) *macros.SMCInnerSimConfig {
 				return buildOUInnerSim(nParticles, rdData, lagData, muData, T)
 			},
 		},
@@ -261,7 +262,7 @@ func buildOUInnerSim(
 	N int,
 	rdData, lagData, muData [][]float64,
 	T int,
-) *analysis.SMCInnerSimConfig {
+) *macros.SMCInnerSimConfig {
 	partitions := make([]*simulator.PartitionConfig, 0, 3+2*N)
 	loglikePartitions := make([]string, N)
 	paramForwarding := make(map[string][]int, N)
@@ -303,12 +304,12 @@ func buildOUInnerSim(
 		loglikeName := fmt.Sprintf("ou_loglike_%d", p)
 
 		partitions = append(partitions, &simulator.PartitionConfig{
-			Name:            paramsName,
-			Iteration:       &general.ParamValuesIteration{},
-			Params:          simulator.NewParams(map[string][]float64{"param_values": {0, 0}}),
-			InitStateValues: []float64{0, 0},
+			Name:              paramsName,
+			Iteration:         &general.ParamValuesIteration{},
+			Params:            simulator.NewParams(map[string][]float64{"param_values": {0, 0}}),
+			InitStateValues:   []float64{0, 0},
 			StateHistoryDepth: 1,
-			Seed:            0,
+			Seed:              0,
 		})
 
 		partitions = append(partitions, &simulator.PartitionConfig{
@@ -336,7 +337,7 @@ func buildOUInnerSim(
 		paramForwarding[paramsName+"/param_values"] = []int{p * 2, p*2 + 1}
 	}
 
-	return &analysis.SMCInnerSimConfig{
+	return &macros.SMCInnerSimConfig{
 		Partitions: partitions,
 		Simulation: &simulator.SimulationConfig{
 			OutputCondition: &simulator.NilOutputCondition{},

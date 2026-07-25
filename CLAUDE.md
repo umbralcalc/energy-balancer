@@ -166,33 +166,33 @@ Runs a complete simulation and stores all partition state histories. Used in `cm
 ### `analysis.AddPartitionsToStateTimeStorage`
 Adds new partitions to an existing storage, replaying over stored data. Used to build OLS intermediate partitions (`ou_delta_rd`, `ou_d_mean`) and the regression stats partition on top of replayed demand data.
 
-### `analysis.NewScalarRegressionStatsPartition`
+### `macros.NewScalarRegressionStatsPartition`
 Builds a streaming scalar OLS regression partition. State layout (no-intercept, cumulative): `[Sxx, Sxy, Syy, n, beta, sigma2]`. Used in `cmd/infer` Step 2.
 
 ```go
-olsPartition := analysis.NewScalarRegressionStatsPartition(
-    analysis.AppliedScalarRegressionStats{
+olsPartition := macros.NewScalarRegressionStatsPartition(
+    macros.AppliedScalarRegressionStats{
         Name:      "ou_ols",
         Y:         analysis.DataRef{PartitionName: "ou_delta_rd"},
         X:         analysis.DataRef{PartitionName: "ou_d_mean"},
         Intercept: false,
-        Mode:      analysis.RegressionStatsCumulative,
+        Mode:      macros.RegressionStatsCumulative,
     }, storage)
 // beta = finalOLS[4], sigma2 = finalOLS[5]
 // theta = -log(1-beta) / dt
 // sigma = sqrt(2*theta*sigma2 / (1 - exp(-2*theta*dt)))
 ```
 
-### `analysis.RunSMCInference`
+### `macros.RunSMCInference`
 Batch sequential Monte Carlo. N particles, each evaluated via an embedded `SMCInnerSimConfig`. Used in `cmd/infer` Step 3. Priors are in log-space (log θ, log σ); results are exponentiated via delta method.
 
 ```go
-result := analysis.RunSMCInference(analysis.AppliedSMCInference{
+result := macros.RunSMCInference(macros.AppliedSMCInference{
     NumParticles: N, NumRounds: rounds,
     ParamNames:   []string{"log_theta", "log_sigma"},
     Priors:       []inference.Prior{...TruncatedNormalPrior...},
-    Model: analysis.SMCParticleModel{
-        Build: func(nParticles, nParams int) *analysis.SMCInnerSimConfig {
+    Model: macros.SMCParticleModel{
+        Build: func(nParticles, nParams int) *macros.SMCInnerSimConfig {
             return buildOUInnerSim(nParticles, rdData, lagData, muData, T)
         },
     },

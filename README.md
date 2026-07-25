@@ -68,14 +68,14 @@ where ε ~ N(0, σ²(1 - exp(-2θΔ)) / 2θ)
 ΔX = β · d + ε,   β = 1 - exp(-θΔ)
 ```
 
-`analysis.NewScalarRegressionStatsPartition` streams cumulative OLS over the replayed data. The OU parameters recover as:
+`macros.NewScalarRegressionStatsPartition` streams cumulative OLS over the replayed data. The OU parameters recover as:
 
 ```
 θ = -ln(1-β) / Δ
 σ = sqrt(2θ · Var(residual) / (1 - exp(-2θΔ)))
 ```
 
-**Step 3 — SMC Bayesian inference** (optional, `-smc` flag). `analysis.RunSMCInference` runs sequential Monte Carlo with N particles, each evaluated against the exact OU transition log-likelihood (`OUTransitionLikelihood`) over all T data steps. Parameters are inferred in log-space (`log θ`, `log σ`) for numerical stability. Priors are truncated normals centred on the OLS estimates.
+**Step 3 — SMC Bayesian inference** (optional, `-smc` flag). `macros.RunSMCInference` runs sequential Monte Carlo with N particles, each evaluated against the exact OU transition log-likelihood (`OUTransitionLikelihood`) over all T data steps. Parameters are inferred in log-space (`log θ`, `log σ`) for numerical stability. Priors are truncated normals centred on the OLS estimates.
 
 ### Stage 3 — Stochastic Simulation (`cmd/simulate`)
 
