@@ -227,8 +227,8 @@ func main() {
 		Seed:    42,
 		Verbose: true,
 		Model: macros.SMCParticleModel{
-			Build: func(nParticles, nParams int) *macros.SMCInnerSimConfig {
-				return buildOUInnerSim(nParticles, rdData, lagData, muData, T)
+			Build: func(nParams int) *macros.SMCInnerSimConfig {
+				return buildOUInnerSim(rdData, lagData, muData, T)
 			},
 		},
 	})
@@ -259,13 +259,10 @@ func main() {
 // Each particle p has params [log_theta_p, log_sigma_p] forwarded from the
 // proposal partition (flat index p*2, p*2+1).
 func buildOUInnerSim(
-	N int,
 	rdData, lagData, muData [][]float64,
 	T int,
 ) *macros.SMCInnerSimConfig {
-	partitions := make([]*simulator.PartitionConfig, 0, 3+2*N)
-	loglikePartitions := make([]string, N)
-	paramForwarding := make(map[string][]int, N)
+	partitions := make([]*simulator.PartitionConfig, 0, 5)
 
 	// Shared data replay partitions.
 	partitions = append(partitions,
@@ -298,44 +295,41 @@ func buildOUInnerSim(
 		},
 	)
 
-	// Per-particle params passthrough and loglike accumulator.
-	for p := range N {
-		paramsName := fmt.Sprintf("ou_params_%d", p)
-		loglikeName := fmt.Sprintf("ou_loglike_%d", p)
+	// This particle's params passthrough and loglike accumulator.
+	const paramsName = "ou_params"
+	const loglikeName = "ou_loglike"
 
-		partitions = append(partitions, &simulator.PartitionConfig{
-			Name:              paramsName,
-			Iteration:         &general.ParamValuesIteration{},
-			Params:            simulator.NewParams(map[string][]float64{"param_values": {0, 0}}),
-			InitStateValues:   []float64{0, 0},
-			StateHistoryDepth: 1,
-			Seed:              0,
-		})
+	partitions = append(partitions, &simulator.PartitionConfig{
+		Name:              paramsName,
+		Iteration:         &general.ParamValuesIteration{},
+		Params:            simulator.NewParams(map[string][]float64{"param_values": {0, 0}}),
+		InitStateValues:   []float64{0, 0},
+		StateHistoryDepth: 1,
+		Seed:              0,
+	})
 
-		partitions = append(partitions, &simulator.PartitionConfig{
-			Name: loglikeName,
-			Iteration: &inference.DataComparisonIteration{
-				Likelihood: &grid.OUTransitionLikelihood{},
-			},
-			Params: simulator.NewParams(map[string][]float64{
-				"cumulative":    {1},
-				"burn_in_steps": {0},
-			}),
-			ParamsFromUpstream: map[string]simulator.NamedUpstreamConfig{
-				"latest_data_values": {Upstream: "residual_demand"},
-				"previous_state":     {Upstream: "lagged_residual_demand"},
-				"mus":                {Upstream: "conditional_mean"},
-				"thetas":             {Upstream: paramsName, Indices: []int{0}},
-				"sigmas":             {Upstream: paramsName, Indices: []int{1}},
-			},
-			InitStateValues:   []float64{0.0},
-			StateHistoryDepth: 1,
-			Seed:              0,
-		})
+	partitions = append(partitions, &simulator.PartitionConfig{
+		Name: loglikeName,
+		Iteration: &inference.DataComparisonIteration{
+			Likelihood: &grid.OUTransitionLikelihood{},
+		},
+		Params: simulator.NewParams(map[string][]float64{
+			"cumulative":    {1},
+			"burn_in_steps": {0},
+		}),
+		ParamsFromUpstream: map[string]simulator.NamedUpstreamConfig{
+			"latest_data_values": {Upstream: "residual_demand"},
+			"previous_state":     {Upstream: "lagged_residual_demand"},
+			"mus":                {Upstream: "conditional_mean"},
+			"thetas":             {Upstream: paramsName, Indices: []int{0}},
+			"sigmas":             {Upstream: paramsName, Indices: []int{1}},
+		},
+		InitStateValues:   []float64{0.0},
+		StateHistoryDepth: 1,
+		Seed:              0,
+	})
 
-		loglikePartitions[p] = loglikeName
-		paramForwarding[paramsName+"/param_values"] = []int{p * 2, p*2 + 1}
-	}
+	paramForwarding := map[string][]int{paramsName + "/param_values": {0, 1}}
 
 	return &macros.SMCInnerSimConfig{
 		Partitions: partitions,
@@ -348,7 +342,7 @@ func buildOUInnerSim(
 			TimestepFunction: &simulator.ConstantTimestepFunction{Stepsize: 0.5},
 			InitTimeValue:    0.0,
 		},
-		LoglikePartitions: loglikePartitions,
-		ParamForwarding:   paramForwarding,
+		LoglikePartition: loglikeName,
+		ParamForwarding:  paramForwarding,
 	}
 }
