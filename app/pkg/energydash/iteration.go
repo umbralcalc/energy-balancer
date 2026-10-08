@@ -37,6 +37,10 @@ const (
 	PAIdxWindScale  = 6
 	PAIdxSolarScale = 7
 	PolicyActionLen = 8
+	// PolicyControlsLen is how many of the action values are controls the
+	// page sends (indices 0-5); wind and solar scale are derived from the
+	// scenario each step, so action_state_values declares only the controls.
+	PolicyControlsLen = 6
 )
 
 // Policy and scenario indices. Match the project's two named policies
@@ -358,7 +362,7 @@ func (o *OutcomesIteration) Iterate(
 		active = 1.0
 	}
 
-	cumRevenue := prev[1] + revenueGBP/1000.0       // store in £k
+	cumRevenue := prev[1] + revenueGBP/1000.0 // store in £k
 	cumEFC := prev[4] + efc
 	cumDegCost := prev[2] + (efc*CostPerEFC)/1000.0 // £k
 	cumNetValue := cumRevenue - cumDegCost

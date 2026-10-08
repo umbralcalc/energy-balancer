@@ -36,6 +36,10 @@ func BuildEnergySimulation() *simulator.ConfigGenerator {
 		Name:      "policy_action",
 		Iteration: &PolicyActionIteration{},
 		Params: simulator.NewParams(map[string][]float64{
+			// The controls only (PolicyControlsLen): the page's sliders and
+			// radios send these six, and dexetera writes actions in place, so
+			// the declared width must match. Wind and solar scale (indices 6
+			// and 7 of the state) are derived from the scenario each step.
 			"action_state_values": {
 				PolicyPrice,
 				Scenario2025,
@@ -43,8 +47,6 @@ func BuildEnergySimulation() *simulator.ConfigGenerator {
 				DefaultPriceLow,
 				DefaultCarbonHigh,
 				DefaultCarbonLow,
-				WindScales[Scenario2025],
-				SolarScales[Scenario2025],
 			},
 		}),
 		InitStateValues: []float64{
