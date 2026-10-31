@@ -6,7 +6,7 @@ require (
 	github.com/go-echarts/go-echarts/v2 v2.6.3
 	github.com/go-gota/gota v0.12.0
 	github.com/umbralcalc/dexetera v0.0.0-20261008070102-13a58cee6c35
-	github.com/umbralcalc/stochadex v0.22.0
+	github.com/umbralcalc/stochadex v0.25.0
 	gonum.org/v1/gonum v0.17.0
 )
 
